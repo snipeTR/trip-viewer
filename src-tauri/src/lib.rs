@@ -5,6 +5,7 @@ pub mod gps;
 mod import;
 mod issues;
 mod metadata;
+mod migration_v2;
 mod model;
 mod paths;
 mod places;
@@ -132,26 +133,69 @@ pub fn run() {
                 }
             };
             install_panic_hook(app_data_dir.join("logs"));
-            // TRANSITIONAL: the DB still lives at app_data_dir/tripviewer.db
-            // and uses app_data_dir as a placeholder archive root. The
-            // per-archive migration in a follow-up change moves the DB
-            // into <user-picked archive>/.tripviewer/tripviewer.db and
-            // sets the real archive root from settings.last_archive.
-            let db_path = app_data_dir.join("tripviewer.db");
-            let handle = match db::open_at_path(&db_path, &app_data_dir) {
+
+            // Sweep stale files left by removed features (e.g.
+            // recovery-config.json) so they don't accumulate in
+            // app_data_dir for users who upgrade in place.
+            migration_v2::cleanup_orphan_files(&app_data_dir);
+
+            // Per-machine settings live in app_data_dir/settings.json
+            // (see src/app_settings.rs).
+            let settings = app_settings::AppSettingsHandle::load(&app_data_dir);
+
+            // If a legacy single-archive DB still sits at
+            // app_data_dir/tripviewer.db and the user hasn't yet
+            // picked an archive folder, derive an archive root from
+            // segment paths and move the file into
+            // <archive>/.tripviewer/tripviewer.db. Failure is
+            // non-fatal — silently retried on every launch.
+            //
+            // Auto-derivation only handles archives produced by the
+            // import pipeline (parent-of-Videos layout). Other shapes
+            // are left in place; PR 3's "Open Archive" picker handles
+            // them explicitly.
+            match migration_v2::run_if_needed(&app_data_dir, &settings) {
+                Ok(migration_v2::MigrationOutcome::Migrated { archive_root }) => {
+                    eprintln!(
+                        "[migration_v2] migrated DB → {}/.tripviewer/tripviewer.db",
+                        archive_root.display()
+                    );
+                }
+                Ok(migration_v2::MigrationOutcome::Skipped { reason }) => {
+                    eprintln!("[migration_v2] skipped: {reason}");
+                }
+                Ok(migration_v2::MigrationOutcome::NotNeeded) => {}
+                Err(e) => eprintln!("[migration_v2] {e}"),
+            }
+
+            // Determine the archive root for this session. With the
+            // single-archive-at-a-time model, this comes from
+            // last_archive in settings.json. If unset (fresh install
+            // or skipped migration), fall back to app_data_dir so the
+            // app still starts cleanly — the multi-archive switcher
+            // in a follow-up change replaces this fallback with a
+            // proper "no archive open" UI state.
+            let archive_root = settings
+                .read()
+                .last_archive
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| app_data_dir.clone());
+
+            let handle = match db::open(&archive_root) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("[db] failed to open {}: {e}", db_path.display());
-                    // Without a managed DB, every command that takes
-                    // tauri::State<DbHandle> would error with the opaque
-                    // "state not managed" message. Show the user the real
-                    // error and bail cleanly instead.
+                    eprintln!(
+                        "[db] failed to open archive at {}: {e}",
+                        archive_root.display()
+                    );
                     app.dialog()
                         .message(format!(
-                            "Trip Viewer can't open its database:\n\n{e}\n\n\
-                             If this database was created by a newer version of Trip Viewer, \
-                             upgrade or move the file aside:\n\n{}",
-                            db_path.display()
+                            "Trip Viewer can't open the archive database:\n\n{e}\n\n\
+                             Archive folder:\n{}\n\n\
+                             If this archive was written by a newer version of Trip Viewer, \
+                             upgrade. If the drive isn't mounted, plug it in and relaunch.",
+                            archive_root.display()
                         ))
                         .kind(MessageDialogKind::Error)
                         .title("Trip Viewer — Database error")
@@ -163,22 +207,6 @@ pub fn run() {
                 eprintln!("[timelapse] cleanup failed at startup: {e}");
             }
 
-            // Per-machine settings live in app_data_dir/settings.json
-            // (see src/app_settings.rs). Load them here so the migration
-            // from the legacy SQLite settings table runs while we still
-            // hold the DB handle, before any command handler can read
-            // a stale value.
-            let settings = app_settings::AppSettingsHandle::load(&app_data_dir);
-            match handle.lock() {
-                Ok(conn) => {
-                    if let Err(e) = app_settings::migrate_from_sqlite(&settings, &conn) {
-                        eprintln!("[app_settings] migration from SQLite failed: {e}");
-                    }
-                }
-                Err(_) => {
-                    eprintln!("[app_settings] db mutex poisoned, skipping migration");
-                }
-            }
             app.manage(settings);
             app.manage(handle);
             if let Some(window) = app.get_webview_window("main") {
