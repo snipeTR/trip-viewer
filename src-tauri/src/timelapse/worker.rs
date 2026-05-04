@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -1010,33 +1010,11 @@ fn should_enqueue(
     })
 }
 
-/// Determine `<library_root>/Timelapses/` and create it if needed.
-/// Prefers the cached `library_root` setting; otherwise derives a root
-/// from any segment's `master_path`. The "real" library root (a path
-/// with `Videos/` as an immediate child) is cached for next time;
-/// fallback roots used when no `Videos/` ancestor is present are not
-/// cached, so a future structured import can still claim the slot.
+/// `<archive_root>/Timelapses/`, created if missing. With the per-archive
+/// DB now living inside the archive, the archive root is implicit (it's
+/// the DB's grandparent) — no more cache key, no more discovery walk.
 fn resolve_output_root(db: &DbHandle) -> Result<PathBuf, AppError> {
-    let root = {
-        let conn = db
-            .lock()
-            .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
-        db::settings::get(&conn, "library_root")?
-    };
-    let library_root = match root {
-        Some(p) => PathBuf::from(p),
-        None => match discover_library_root(db)? {
-            DiscoveredRoot::Library(p) => {
-                let conn = db
-                    .lock()
-                    .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
-                db::settings::set(&conn, "library_root", &p.to_string_lossy())?;
-                p
-            }
-            DiscoveredRoot::SegmentParent(p) => p,
-        },
-    };
-    let out = library_root.join("Timelapses");
+    let out = db.archive_root().join("Timelapses");
     std::fs::create_dir_all(&out)?;
     Ok(out)
 }
@@ -1045,27 +1023,25 @@ fn resolve_output_root(db: &DbHandle) -> Result<PathBuf, AppError> {
 ///
 /// `Library` is the "structured" answer — the segment path lived under
 /// a `Videos/` directory, so we know its parent is a real library root
-/// laid out by the import pipeline. Safe to cache.
+/// laid out by the import pipeline.
 ///
 /// `SegmentParent` is the fallback: the segment was scanned in place
-/// from an arbitrary folder. Timelapses go next to the source files,
-/// but we don't cache the path because a later structured import to a
-/// different location should be allowed to win on rediscovery.
-enum DiscoveredRoot {
+/// from an arbitrary folder.
+///
+/// Used only by the per-archive migration to suggest an archive root
+/// from the legacy DB's absolute `master_path` values. Once the user
+/// confirms the root, the per-archive DB stores paths *relative* to it
+/// and discovery is no longer needed at runtime.
+#[allow(dead_code)] // wired up by migration_v2 in the next change.
+pub(crate) enum DiscoveredRoot {
     Library(PathBuf),
     SegmentParent(PathBuf),
 }
 
-fn discover_library_root(db: &DbHandle) -> Result<DiscoveredRoot, AppError> {
-    let conn = db
-        .lock()
-        .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
+#[allow(dead_code)] // wired up by migration_v2 in the next change.
+pub(crate) fn discover_library_root(conn: &Connection) -> Result<DiscoveredRoot, AppError> {
     let sample: Option<String> = conn
-        .query_row(
-            "SELECT master_path FROM segments LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT master_path FROM segments LIMIT 1", [], |r| r.get(0))
         .ok();
     let Some(sample_path) = sample else {
         return Err(AppError::Internal(
@@ -1124,7 +1100,8 @@ mod tests {
         let db = open_in_memory().unwrap();
         // SD-card / folder-import layout: <root>/Videos/<file>
         insert_segment_with_path(&db, "/library/Videos/2026_04_12_132511_00_F.MP4");
-        match discover_library_root(&db).unwrap() {
+        let conn = db.lock().unwrap();
+        match discover_library_root(&conn).unwrap() {
             DiscoveredRoot::Library(p) => {
                 assert_eq!(p, PathBuf::from("/library"));
             }
@@ -1142,7 +1119,8 @@ mod tests {
             &db,
             "/Users/chrisl8/Dashcam Tests/Wolfbox Example/2026_04_12_132511_00_F.MP4",
         );
-        match discover_library_root(&db).unwrap() {
+        let conn = db.lock().unwrap();
+        match discover_library_root(&conn).unwrap() {
             DiscoveredRoot::SegmentParent(p) => {
                 assert_eq!(
                     p,
@@ -1156,24 +1134,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_output_root_does_not_cache_fallback_root() {
-        let db = open_in_memory().unwrap();
+    fn resolve_output_root_uses_archive_root() {
         let scan_dir = unique_dir("scan-fallback");
         let _ = fs::remove_dir_all(&scan_dir);
         fs::create_dir_all(&scan_dir).unwrap();
-        let segment = scan_dir.join("2026_04_12_132511_00_F.MP4");
-        insert_segment_with_path(&db, segment.to_str().unwrap());
+        // Archive root is now bundled into the DB handle — no more
+        // segment-walking discovery; the DB simply lives at
+        // <archive>/.tripviewer/tripviewer.db so the parent of its
+        // parent is the archive root.
+        let db = crate::db::open_in_memory_with_root(&scan_dir).unwrap();
 
         let out = resolve_output_root(&db).unwrap();
         assert_eq!(out, scan_dir.join("Timelapses"));
         assert!(out.is_dir(), "Timelapses/ directory should be created");
-
-        // Fallback discovery must not persist library_root — a future
-        // structured import should still be able to claim the slot.
-        let conn = db.lock().unwrap();
-        let cached = db::settings::get(&conn, "library_root").unwrap();
-        assert!(cached.is_none(), "fallback root must not be cached, got {cached:?}");
-        drop(conn);
 
         let _ = fs::remove_dir_all(&scan_dir);
     }

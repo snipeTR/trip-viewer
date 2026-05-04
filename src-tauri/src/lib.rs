@@ -6,6 +6,7 @@ mod import;
 mod issues;
 mod metadata;
 mod model;
+mod paths;
 mod places;
 pub mod scan;
 mod scans;
@@ -131,8 +132,13 @@ pub fn run() {
                 }
             };
             install_panic_hook(app_data_dir.join("logs"));
+            // TRANSITIONAL: the DB still lives at app_data_dir/tripviewer.db
+            // and uses app_data_dir as a placeholder archive root. The
+            // per-archive migration in a follow-up change moves the DB
+            // into <user-picked archive>/.tripviewer/tripviewer.db and
+            // sets the real archive root from settings.last_archive.
             let db_path = app_data_dir.join("tripviewer.db");
-            let handle = match db::open(&db_path) {
+            let handle = match db::open_at_path(&db_path, &app_data_dir) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[db] failed to open {}: {e}", db_path.display());

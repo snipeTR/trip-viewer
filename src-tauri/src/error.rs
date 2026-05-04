@@ -26,6 +26,19 @@ pub enum AppError {
 
     #[error("database error: {0}")]
     Db(String),
+
+    /// A path was passed where it must live under the active archive root,
+    /// but it doesn't. Surfaced during scans/imports and during the legacy
+    /// migration when a stored absolute path can't be relativized.
+    #[error("path is outside the active archive: {path}")]
+    PathOutsideArchive { path: String },
+
+    /// The archive's SQLite `user_version` is higher than what this build
+    /// of Trip Viewer knows how to apply. Almost always means the user
+    /// opened the archive on a newer release, then came back to an older
+    /// one. Refuse rather than silently risk corruption.
+    #[error("archive schema is newer than this app supports (found {found}, this build expects ≤ {expected})")]
+    ArchiveSchemaTooNew { found: i32, expected: i32 },
 }
 
 impl From<rusqlite::Error> for AppError {

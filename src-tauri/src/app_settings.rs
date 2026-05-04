@@ -133,9 +133,11 @@ fn save_atomic(path: &Path, settings: &AppSettings) -> Result<(), AppError> {
 /// once `schema_version >= CURRENT_SCHEMA_VERSION`, this is a no-op.
 ///
 /// Reads the four per-machine keys, populates the in-memory settings,
-/// deletes those keys from SQLite, and saves the JSON file. `library_root`
-/// is intentionally left in SQLite — PR 2 retires it together with the
-/// path-rewrite migration.
+/// and saves the JSON file. The legacy SQLite rows are left in place —
+/// the per-archive migration backs up the legacy DB whole-cloth, so a
+/// targeted DELETE here would be wasted work. Operating only as a
+/// reader also lets us run against a read-only connection, which the
+/// per-archive migration uses for safety.
 pub fn migrate_from_sqlite(
     handle: &AppSettingsHandle,
     db: &rusqlite::Connection,
@@ -173,20 +175,30 @@ pub fn migrate_from_sqlite(
         s.schema_version = CURRENT_SCHEMA_VERSION;
     })?;
 
-    db.execute(
-        "DELETE FROM settings WHERE key IN
-            ('ffmpeg_path','ffmpeg_version','nvenc_hevc','timelapse_max_concurrent_jobs')",
-        [],
-    )?;
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::open_in_memory;
     use tempfile::tempdir;
+
+    /// Build a connection with the legacy schema shape (settings table
+    /// present) so the migration tests have something to read out of.
+    /// Production fresh-archive DBs no longer carry the settings table
+    /// — see migration 0011.
+    fn legacy_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            )",
+        )
+        .unwrap();
+        conn
+    }
 
     #[test]
     fn load_missing_returns_default() {
@@ -242,18 +254,15 @@ mod tests {
     fn migration_pulls_keys_from_sqlite() {
         let dir = tempdir().unwrap();
         let h = AppSettingsHandle::load(dir.path());
-        let db = open_in_memory().unwrap();
-        {
-            let conn = db.lock().unwrap();
-            crate::db::settings::set(&conn, "ffmpeg_path", "/usr/bin/ffmpeg").unwrap();
-            crate::db::settings::set(&conn, "ffmpeg_version", "8.1").unwrap();
-            crate::db::settings::set(&conn, "nvenc_hevc", "1").unwrap();
-            crate::db::settings::set(&conn, "timelapse_max_concurrent_jobs", "4").unwrap();
-            // library_root must NOT migrate in PR 1.
-            crate::db::settings::set(&conn, "library_root", "/some/path").unwrap();
-        }
+        let conn = legacy_conn();
+        crate::db::settings::set(&conn, "ffmpeg_path", "/usr/bin/ffmpeg").unwrap();
+        crate::db::settings::set(&conn, "ffmpeg_version", "8.1").unwrap();
+        crate::db::settings::set(&conn, "nvenc_hevc", "1").unwrap();
+        crate::db::settings::set(&conn, "timelapse_max_concurrent_jobs", "4").unwrap();
+        // library_root is per-archive scope, not per-machine; the
+        // per-archive migration handles it separately.
+        crate::db::settings::set(&conn, "library_root", "/some/path").unwrap();
 
-        let conn = db.lock().unwrap();
         migrate_from_sqlite(&h, &conn).unwrap();
 
         let s = h.read();
@@ -263,20 +272,15 @@ mod tests {
         assert_eq!(s.timelapse_max_concurrent_jobs, Some(4));
         assert_eq!(s.schema_version, CURRENT_SCHEMA_VERSION);
 
-        // Migrated keys deleted from SQLite, library_root preserved.
-        assert!(crate::db::settings::get(&conn, "ffmpeg_path")
-            .unwrap()
-            .is_none());
-        assert!(crate::db::settings::get(&conn, "ffmpeg_version")
-            .unwrap()
-            .is_none());
-        assert!(crate::db::settings::get(&conn, "nvenc_hevc")
-            .unwrap()
-            .is_none());
-        assert!(
-            crate::db::settings::get(&conn, "timelapse_max_concurrent_jobs")
+        // Legacy SQLite rows are *not* deleted — the per-archive
+        // migration backs up the legacy DB whole-cloth, so we don't
+        // bother with targeted cleanup here. Keeping this read-only
+        // also lets us run against a read-only connection.
+        assert_eq!(
+            crate::db::settings::get(&conn, "ffmpeg_path")
                 .unwrap()
-                .is_none()
+                .as_deref(),
+            Some("/usr/bin/ffmpeg")
         );
         assert_eq!(
             crate::db::settings::get(&conn, "library_root")
@@ -290,12 +294,8 @@ mod tests {
     fn migration_is_idempotent() {
         let dir = tempdir().unwrap();
         let h = AppSettingsHandle::load(dir.path());
-        let db = open_in_memory().unwrap();
-        {
-            let conn = db.lock().unwrap();
-            crate::db::settings::set(&conn, "ffmpeg_path", "/first").unwrap();
-        }
-        let conn = db.lock().unwrap();
+        let conn = legacy_conn();
+        crate::db::settings::set(&conn, "ffmpeg_path", "/first").unwrap();
         migrate_from_sqlite(&h, &conn).unwrap();
 
         // Second call is a no-op even if SQLite is somehow re-populated.
@@ -303,23 +303,13 @@ mod tests {
         migrate_from_sqlite(&h, &conn).unwrap();
 
         assert_eq!(h.read().ffmpeg_path.as_deref(), Some("/first"));
-        // The hand-injected /second row isn't deleted because the migration
-        // short-circuits on schema_version. That's expected — we only run
-        // the SQLite cleanup once.
-        assert_eq!(
-            crate::db::settings::get(&conn, "ffmpeg_path")
-                .unwrap()
-                .as_deref(),
-            Some("/second")
-        );
     }
 
     #[test]
     fn migration_with_empty_sqlite_still_bumps_version() {
         let dir = tempdir().unwrap();
         let h = AppSettingsHandle::load(dir.path());
-        let db = open_in_memory().unwrap();
-        let conn = db.lock().unwrap();
+        let conn = legacy_conn();
         migrate_from_sqlite(&h, &conn).unwrap();
         let s = h.read();
         assert_eq!(s.schema_version, CURRENT_SCHEMA_VERSION);
