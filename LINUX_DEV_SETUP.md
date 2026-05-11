@@ -168,3 +168,21 @@ A locally-built AppImage from the dev container has matching libgstreamer/libgli
 **Workaround for daily use on Fedora derivatives**: develop and run from inside the dev container — `npm run tauri dev` for a hot-reload session, or run the compiled release binary directly with `distrobox enter tripviewer-dev -- /path/to/trip-viewer/src-tauri/target/release/tripviewer` after a `npm run tauri build`. (`distrobox-export --bin <path>` will also expose the binary on the host PATH.)
 
 A proper fix — bundling GStreamer plugins via `linuxdeploy-plugin-gstreamer` as a post-build step — is still on the roadmap.
+
+---
+
+## Troubleshooting
+
+### Blank/grey window when running `npm run tauri dev` on NVIDIA + X11
+
+WebKitGTK 2.42+ uses a DMA-BUF renderer by default that doesn't play well with the proprietary NVIDIA driver. Symptom: the title bar appears but the WebView area renders as a solid dark grey rectangle. The console may also log lines like `Failed to create GBM buffer of size … : Invalid argument`.
+
+Fix: set `WEBKIT_DISABLE_DMABUF_RENDERER=1` in the environment that launches the app. For one-off use:
+
+```bash
+WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
+```
+
+For permanent use on a dev machine, add it to your shell config (e.g. `set -gx WEBKIT_DISABLE_DMABUF_RENDERER 1` in `~/.config/fish/config.fish`, or `export WEBKIT_DISABLE_DMABUF_RENDERER=1` in `~/.bashrc`/`~/.zshrc`). Harmless on non-NVIDIA setups — WebKit ignores the variable when the DMA-BUF path was working anyway.
+
+The released AppImage isn't affected (its WebKit bundle predates the DMA-BUF renderer change).
