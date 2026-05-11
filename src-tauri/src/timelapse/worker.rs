@@ -427,7 +427,15 @@ fn process_item(
     ) {
         Ok(r) => r,
         Err(e) => {
-            let _ = record_failed(db, item, &format!("sibling lookup failed: {e}"));
+            let msg = format!("sibling lookup failed: {e}");
+            eprintln!(
+                "[timelapse] job failed: trip={} tier={} channel={} error={}",
+                item.trip_id,
+                item.tier.as_str(),
+                item.channel.as_str(),
+                msg
+            );
+            let _ = record_failed(db, item, &msg);
             return ProcessOutcome::Failed;
         }
     };
@@ -445,7 +453,15 @@ fn process_item(
     ));
     if let Err(e) = std::fs::create_dir_all(&scratch_dir) {
         let _ = std::fs::remove_dir(&scratch_dir);
-        let _ = record_failed(db, item, &format!("scratch dir create failed: {e}"));
+        let msg = format!("scratch dir create failed: {e}");
+        eprintln!(
+            "[timelapse] job failed: trip={} tier={} channel={} error={}",
+            item.trip_id,
+            item.tier.as_str(),
+            item.channel.as_str(),
+            msg
+        );
+        let _ = record_failed(db, item, &msg);
         return ProcessOutcome::Failed;
     }
 
@@ -453,11 +469,15 @@ fn process_item(
         SiblingResolution::Complete(v) => (v, 0usize),
         SiblingResolution::CameraDoesNotRecord => {
             sweep_scratch_dir(&scratch_dir);
-            let _ = record_failed(
-                db,
-                item,
-                "no files for this channel (camera may not record it)",
+            let msg = "no files for this channel (camera may not record it)";
+            eprintln!(
+                "[timelapse] job failed: trip={} tier={} channel={} error={}",
+                item.trip_id,
+                item.tier.as_str(),
+                item.channel.as_str(),
+                msg
             );
+            let _ = record_failed(db, item, msg);
             return ProcessOutcome::Failed;
         }
         SiblingResolution::PadWithBlack {
@@ -472,14 +492,18 @@ fn process_item(
                 Ok(m) => m,
                 Err(e) => {
                     sweep_scratch_dir(&scratch_dir);
-                    let _ = record_failed(
-                        db,
-                        item,
-                        &format!(
-                            "failed to probe reference sibling \
-                             {reference_sibling} to size black placeholders: {e}"
-                        ),
+                    let msg = format!(
+                        "failed to probe reference sibling \
+                         {reference_sibling} to size black placeholders: {e}"
                     );
+                    eprintln!(
+                        "[timelapse] job failed: trip={} tier={} channel={} error={}",
+                        item.trip_id,
+                        item.tier.as_str(),
+                        item.channel.as_str(),
+                        msg
+                    );
+                    let _ = record_failed(db, item, &msg);
                     return ProcessOutcome::Failed;
                 }
             };
@@ -530,11 +554,15 @@ fn process_item(
             }
             if let Some(e) = placeholder_err {
                 sweep_scratch_dir(&scratch_dir);
-                let _ = record_failed(
-                    db,
-                    item,
-                    &format!("black placeholder generation failed: {e}"),
+                let msg = format!("black placeholder generation failed: {e}");
+                eprintln!(
+                    "[timelapse] job failed: trip={} tier={} channel={} error={}",
+                    item.trip_id,
+                    item.tier.as_str(),
+                    item.channel.as_str(),
+                    msg
                 );
+                let _ = record_failed(db, item, &msg);
                 return ProcessOutcome::Failed;
             }
             (built, missing_count)
@@ -619,6 +647,13 @@ fn process_item(
             ProcessOutcome::Cancelled
         }
         Err(e) => {
+            eprintln!(
+                "[timelapse] job failed: trip={} tier={} channel={} error={}",
+                item.trip_id,
+                item.tier.as_str(),
+                item.channel.as_str(),
+                e
+            );
             let _ = record_failed(db, item, &e.to_string());
             ProcessOutcome::Failed
         }
@@ -759,7 +794,15 @@ fn camera_kind_from_str(s: &str) -> CameraKind {
 
 /// All segments of a trip, ordered by start time, with the info
 /// needed for both the concat list and GPS stitching.
+///
+/// Post-migration the `master_path` column holds archive-relative
+/// forward-slash paths; the timelapse pipeline (ffmpeg and
+/// `find_sibling_file`) needs absolute paths on the local filesystem,
+/// so each row is rejoined to `db.archive_root()` here.
+/// `from_archive_relative` returns the stored value unchanged when it's
+/// already absolute, so pre-migration rows still resolve correctly.
 fn trip_segment_info(db: &DbHandle, trip_id: &str) -> Result<Vec<SegmentInfo>, AppError> {
+    let archive_root = db.archive_root().to_path_buf();
     let conn = db
         .lock()
         .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
@@ -780,9 +823,10 @@ fn trip_segment_info(db: &DbHandle, trip_id: &str) -> Result<Vec<SegmentInfo>, A
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (path, duration, kind) = r?;
+        let (rel_path, duration, kind) = r?;
+        let abs_path = crate::paths::from_archive_relative(&rel_path, &archive_root);
         out.push(SegmentInfo {
-            master_path: path,
+            master_path: abs_path.to_string_lossy().into_owned(),
             duration_s: duration,
             camera_kind: camera_kind_from_str(&kind),
         });
