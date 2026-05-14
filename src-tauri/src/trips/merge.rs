@@ -21,7 +21,6 @@
 //! marked set).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use crate::timelapse::ffmpeg::ffmpeg_command;
 
 use rusqlite::{params, Connection};
@@ -31,8 +30,6 @@ use uuid::Uuid;
 use crate::db::DbHandle;
 use crate::error::AppError;
 use crate::timelapse::speed_curve::CurveSegment;
-
-const SETTING_LIBRARY_ROOT: &str = "library_root";
 
 // ── Public types (also serialized for IPC) ──────────────────────────
 
@@ -412,22 +409,11 @@ fn apply_concat_where_possible(
         }
     }
 
-    // ffmpeg path is supplied by the caller (per-machine setting).
-    // library_root remains in the SQLite settings table — PR 2 retires it
-    // along with the path-rewrite migration.
-    let library_root = {
-        let conn = db
-            .lock()
-            .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
-        crate::db::settings::get(&conn, SETTING_LIBRARY_ROOT)?
-            .ok_or_else(|| {
-                AppError::Internal(
-                    "library root not yet known — open a folder once before merging".into(),
-                )
-            })?
-    };
-
-    let timelapses_dir = PathBuf::from(&library_root).join("Timelapses");
+    // ffmpeg path is supplied by the caller (per-machine setting). The
+    // archive root is implicit in the DbHandle now — the per-archive DB
+    // lives inside the archive, so `db.archive_root()` is the canonical
+    // source of truth.
+    let timelapses_dir = db.archive_root().join("Timelapses");
     let total_sources = absorbed.len() + 1;
     let mut concatenated_paths_to_keep: HashSet<String> = HashSet::new();
     let mut rows_to_delete: Vec<(String, String, String)> = Vec::new();
