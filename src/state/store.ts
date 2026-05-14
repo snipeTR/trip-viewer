@@ -61,6 +61,11 @@ export interface LibrarySlice {
   selectedTripId: string | null;
   scanErrors: ScanError[];
   gpsByFile: Record<string, GpsPoint[]>;
+  /** Trip-stitched GPS loaded from the DB at trip-select time. Present
+   *  for trips whose timelapse encode has persisted GPS via migration
+   *  0012's `trip_gps` table. Absent key → fall back to gpsByFile
+   *  (which requires the originals to still be on disk). */
+  tripGpsByTrip: Record<string, GpsPoint[]>;
   /** Library-wide bytes used + reclaimable, refreshed after every
    *  storage-changing action. `null` until the first refresh resolves. */
   librarySummary: LibraryStorageSummary | null;
@@ -68,6 +73,12 @@ export interface LibrarySlice {
    *  `librarySummary.reclaimableTripIds`. Toggled by clicking the
    *  reclaimable count in the sidebar header. */
   reclaimableFilter: boolean;
+  /** False until the first auto-scan (or archive-only merge) on app
+   *  start has resolved. The sidebar trip list and welcome panel show
+   *  a "Loading library…" placeholder while this is false so the user
+   *  never sees the brief intermediate state where only archive-only
+   *  trips have landed but the folder scan is still running. */
+  libraryFirstLoadDone: boolean;
 }
 
 export interface PlaybackSlice {
@@ -262,8 +273,10 @@ export const useStore = create<AppState>((set) => ({
   selectedTripId: null,
   scanErrors: [],
   gpsByFile: {},
+  tripGpsByTrip: {},
   librarySummary: null,
   reclaimableFilter: false,
+  libraryFirstLoadDone: false,
   markedForMerge: new Set<string>(),
 
   loadedTripId: null,
@@ -351,7 +364,14 @@ export const useStore = create<AppState>((set) => ({
     }),
 
   setStatus: (status) => set({ status }),
-  setError: (error) => set({ error, status: error ? "error" : "idle" }),
+  setError: (error) =>
+    set({
+      error,
+      status: error ? "error" : "idle",
+      // Unstick the "Loading library…" placeholder so the user sees
+      // the error / empty state instead of an indefinite spinner.
+      ...(error ? { libraryFirstLoadDone: true } : {}),
+    }),
   setVideoPort: (videoPort) => set({ videoPort }),
   setMainView: (mainView) => set({ mainView }),
   setCurrentArchive: (currentArchive) => set({ currentArchive }),
@@ -370,8 +390,14 @@ export const useStore = create<AppState>((set) => ({
     // the trip list. Done after the scan-result set so the user sees
     // their freshly-scanned trips immediately, with archive-only ones
     // sliding in once the DB query returns. Sorted by startTime so they
-    // interleave correctly.
-    void useStore.getState().mergeArchiveOnlyTrips();
+    // interleave correctly. Flip `libraryFirstLoadDone` only after the
+    // merge resolves — otherwise the sidebar briefly shows "No trips
+    // loaded" between setScanResult (which clears the placeholder)
+    // and mergeArchiveOnlyTrips landing the archive-only entries.
+    void useStore
+      .getState()
+      .mergeArchiveOnlyTrips()
+      .finally(() => useStore.setState({ libraryFirstLoadDone: true }));
     // Sizes change on every scan (new segments, vanished segments,
     // backfilled sizes from migration 0009) — refresh the header
     // summary so "X GB used / Y GB reclaimable" stays honest.

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import clsx from "clsx";
-import { extractGpsBatch } from "../../ipc/gps";
+import { extractGpsBatch, loadTripGps } from "../../ipc/gps";
 import { useStore } from "../../state/store";
 import type { Trip } from "../../types/model";
 import type { TimelapseJobRow } from "../../ipc/timelapse";
@@ -54,6 +54,7 @@ export function TripList() {
   const reclaimableIds = useStore(
     (s) => s.librarySummary?.reclaimableTripIds ?? null,
   );
+  const libraryFirstLoadDone = useStore((s) => s.libraryFirstLoadDone);
   const [showMergeDialog, setShowMergeDialog] = useState(false);
 
   const markedTrips = trips.filter((t) => markedForMerge.has(t.id));
@@ -69,11 +70,31 @@ export function TripList() {
     selectTrip(tripId);
     const trip = useStore.getState().trips.find((t) => t.id === tripId);
     if (!trip) return;
-    // GPS data lives with the first/master channel (Front on Wolf Box,
-    // first in canonical order otherwise). We pair each path with its
-    // segment's cameraKind so the backend dispatches to the right decoder
-    // (Wolf Box's ShenShu meta-track vs. Miltona's gps0 atom vs. Thinkware's
-    // none-at-all).
+
+    // Fast path: the timelapse encoder archives trip-stitched GPS in
+    // the DB (migration 0012's trip_gps table). Use it when present so
+    // the map + speed graph render even when originals are gone. An
+    // empty result means "no row archived yet" — fall through to the
+    // per-segment path which only succeeds when originals exist.
+    try {
+      const archived = await loadTripGps(tripId);
+      if (archived.length > 0) {
+        useStore.setState((s) => ({
+          tripGpsByTrip: { ...s.tripGpsByTrip, [tripId]: archived },
+        }));
+        return;
+      }
+    } catch (e) {
+      console.error("loadTripGps failed:", e);
+    }
+
+    // Archive-only trips have no segment files to extract from. Without
+    // an archived GPS row they show an empty map — there's nothing to
+    // fall back to since the originals are already trashed.
+    if (trip.archiveOnly) return;
+
+    // Fallback: extract from each segment's master channel file. The
+    // backend dispatches to the right decoder per cameraKind.
     const requests = trip.segments
       .map((s) => {
         const path = s.channels[0]?.filePath;
@@ -92,6 +113,18 @@ export function TripList() {
     } catch (e) {
       console.error("GPS extraction failed:", e);
     }
+  }
+
+  if (!libraryFirstLoadDone) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-4 text-sm text-neutral-500">
+        <span
+          className="inline-block h-3 w-3 animate-pulse rounded-full bg-blue-500"
+          aria-hidden
+        />
+        Loading library…
+      </div>
+    );
   }
 
   if (trips.length === 0) {

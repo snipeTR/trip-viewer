@@ -14,6 +14,7 @@ import { useStore } from "../../state/store";
 export function WelcomePanel() {
   const status = useStore((s) => s.status);
   const tripCount = useStore((s) => s.trips.length);
+  const libraryFirstLoadDone = useStore((s) => s.libraryFirstLoadDone);
 
   return (
     <div className="flex h-full flex-col items-center justify-center bg-neutral-950 p-8 text-neutral-300">
@@ -21,8 +22,8 @@ export function WelcomePanel() {
         <h2 className="mb-3 text-base font-semibold text-neutral-100">
           Welcome to Trip Viewer
         </h2>
-        {status === "loading" ? (
-          <p className="text-sm text-neutral-400">Scanning folder…</p>
+        {!libraryFirstLoadDone || status === "loading" ? (
+          <p className="text-sm text-neutral-400">Loading library…</p>
         ) : status !== "ready" || tripCount === 0 ? (
           <ol className="space-y-2 text-sm text-neutral-400">
             <li>

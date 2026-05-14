@@ -12,6 +12,7 @@ mod paths;
 mod places;
 pub mod scan;
 mod scans;
+mod startup;
 mod storage;
 mod tags;
 mod timelapse;
@@ -175,19 +176,18 @@ pub fn run() {
             // shows the no-archive empty state and the user picks via
             // the archive switcher.
             let slot = archive::new_slot();
+            // DbHandle clone for the background startup runner. We
+            // open the DB synchronously (cheap) so `app.state` is
+            // ready, but defer the slow housekeeping
+            // (cleanup_stale_jobs / backfill_trip_gps /
+            // rebuild_for_cross_os) until after `window.show()`.
+            let mut db_for_startup: Option<db::DbHandle> = None;
             if let Some(last) = settings.read().last_archive.clone() {
                 let archive_root = std::path::PathBuf::from(&last);
                 if archive_root.is_dir() {
                     match db::open(&archive_root) {
                         Ok(h) => {
-                            if let Err(e) = timelapse::cleanup::cleanup_stale_jobs(&h) {
-                                eprintln!("[timelapse] cleanup failed at startup: {e}");
-                            }
-                            if let Err(e) = migration_v2::rebuild_for_cross_os(&h, &settings) {
-                                eprintln!(
-                                    "[migration_v2] cross-OS rewrite failed: {e}"
-                                );
-                            }
+                            db_for_startup = Some(h.clone());
                             if let Ok(mut g) = slot.write() {
                                 *g = Some(h);
                             }
@@ -213,6 +213,8 @@ pub fn run() {
 
             app.manage(settings);
             app.manage(slot);
+            let startup_state = startup::new_state();
+            app.manage(startup_state.clone());
             if let Some(window) = app.get_webview_window("main") {
                 // 1. Restore saved position/size/maximized first so the fit
                 //    clamp runs against the real geometry the user expects.
@@ -229,6 +231,24 @@ pub fn run() {
                     eprintln!("[window] failed to show: {e}");
                 }
             }
+
+            // Spawn deferred startup housekeeping on a blocking thread
+            // so the window can paint immediately. The frontend renders
+            // a splash that subscribes to `startup:*` events and
+            // dismisses on `startup:done`. With no archive open there's
+            // nothing to do — mark the snapshot done so the splash
+            // never appears.
+            let app_handle = app.handle().clone();
+            match db_for_startup {
+                Some(db) => {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        startup::run(app_handle, db);
+                    });
+                }
+                None => {
+                    startup::mark_no_work(&startup_state, &app_handle);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -241,6 +261,7 @@ pub fn run() {
             metadata::probe_file,
             gps::extract_gps,
             gps::extract_gps_batch,
+            gps::load_trip_gps,
             import::discover_sources,
             import::start_import,
             import::start_folder_import,
@@ -275,6 +296,7 @@ pub fn run() {
             places::commands::update_place,
             places::commands::delete_place,
             storage::get_library_storage_summary,
+            startup::get_startup_status,
             get_video_port,
         ])
         .run(tauri::generate_context!())

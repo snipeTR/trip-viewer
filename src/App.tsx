@@ -32,6 +32,13 @@ import {
   onTimelapseProgress,
   onTimelapseDone,
 } from "./ipc/timelapse";
+import {
+  getStartupStatus,
+  onStartupDone,
+  onStartupProgress,
+  type StartupSnapshot,
+} from "./ipc/startup";
+import { StartupSplash } from "./components/StartupSplash";
 
 function App() {
   const trips = useStore((s) => s.trips);
@@ -48,6 +55,7 @@ function App() {
   const setReclaimableFilter = useStore((s) => s.setReclaimableFilter);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [version, setVersion] = useState("");
+  const [startup, setStartup] = useState<StartupSnapshot | null>(null);
 
   useEffect(() => {
     getVersion().then(setVersion);
@@ -56,11 +64,22 @@ function App() {
       .catch((e) => console.error("get_video_port failed", e));
     // Hydrate the active archive from the backend so the rest of the
     // app knows whether to render the empty state vs the trip list.
-    // Backend opened the last archive in setup() if reachable.
+    // Backend opened the last archive in setup() if reachable. If
+    // there's no archive open we mark the library "first load done"
+    // immediately — there's nothing to load and the sidebar would
+    // otherwise spin forever.
     void import("./ipc/archive")
       .then(({ currentArchive }) => currentArchive())
-      .then((info) => useStore.getState().setCurrentArchive(info))
-      .catch((e) => console.error("currentArchive hydration failed", e));
+      .then((info) => {
+        useStore.getState().setCurrentArchive(info);
+        if (!info) {
+          useStore.setState({ libraryFirstLoadDone: true });
+        }
+      })
+      .catch((e) => {
+        console.error("currentArchive hydration failed", e);
+        useStore.setState({ libraryFirstLoadDone: true });
+      });
     void useStore.getState().loadUserApplicableTags();
     void useStore.getState().refreshPlaces();
     // Load ffmpeg path + capabilities eagerly so that by the time the
@@ -73,14 +92,46 @@ function App() {
     // remains) and by the segment-delete flow to know whether to keep
     // a now-empty trip alive in the sidebar.
     void useStore.getState().refreshTimelapseJobs();
-    // Surface any archive-only trips at startup, even before the user
-    // opens a folder. They live in the DB; the sidebar should show
-    // them as soon as the app loads.
-    void useStore.getState().mergeArchiveOnlyTrips();
+    // Archive-only trips are merged by `setScanResult` after the
+    // initial auto-scan completes (see TripLoader). Doing it here too
+    // caused a confusing intermediate state where the sidebar briefly
+    // showed only the 1 archive-only trip before the dozens of real
+    // ones landed a second later.
     // Library-wide totals — populated from the DB without needing a
     // scan first, so the sidebar shows real numbers immediately.
     void useStore.getState().refreshLibrarySummary();
   }, [setVideoPort]);
+
+  // Startup splash: subscribe FIRST so we don't miss events emitted
+  // between the initial snapshot query and the listener attaching,
+  // then seed state from the snapshot. Backend marks the snapshot
+  // `done` immediately when there's nothing to do, in which case the
+  // splash never renders.
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: Promise<() => void>[] = [];
+    unlisteners.push(
+      onStartupProgress((s) => {
+        if (!cancelled) setStartup(s);
+      }),
+    );
+    unlisteners.push(
+      onStartupDone((s) => {
+        if (!cancelled) setStartup(s);
+      }),
+    );
+    getStartupStatus()
+      .then((s) => {
+        if (!cancelled) setStartup(s);
+      })
+      .catch((e) => console.error("getStartupStatus failed", e));
+    return () => {
+      cancelled = true;
+      for (const p of unlisteners) {
+        p.then((unlisten) => unlisten());
+      }
+    };
+  }, []);
 
   // Attach scan-pipeline event listeners at the app root so progress
   // updates keep flowing even when the user navigates away from ScanView.
@@ -180,6 +231,8 @@ function App() {
 
   return (
     <HevcSupportGate>
+    <>
+    {startup && !startup.done && <StartupSplash snapshot={startup} />}
     <div className="flex h-full">
       <aside className="flex w-72 flex-col border-r border-neutral-800">
         <header className="flex flex-col gap-3 border-b border-neutral-800 p-3">
@@ -297,6 +350,7 @@ function App() {
     <UnknownFilesDialog />
     <ImportSummary />
     <UpdateChecker />
+    </>
     </HevcSupportGate>
   );
 }
