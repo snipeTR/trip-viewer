@@ -26,6 +26,14 @@ const WOLFBOX_MIN_MATCH: usize = 3;
 const THINKWARE_FOLDERS: &[&str] = &["cont_rec", "evt_rec", "manual_rec", "parking_rec"];
 const THINKWARE_MIN_MATCH: usize = 2;
 
+/// 70mai folder names (A810 + RC12). The card holds capitalized mode
+/// folders at the root; `detect_dashcam_kind` lowercases names before
+/// comparing. The threshold is 4 of 5 — the `Normal`/`Event`/`Parking`/
+/// `Lapse` quartet is a very distinctive signature, but we don't require
+/// `Photo` since a user may have cleared it.
+const SEVENTYMAI_FOLDERS: &[&str] = &["normal", "event", "parking", "lapse", "photo"];
+const SEVENTYMAI_MIN_MATCH: usize = 4;
+
 /// System directories to skip during file counting.
 const SKIPPED_DIRS: &[&str] = &["system volume information", "$recycle.bin"];
 
@@ -35,8 +43,8 @@ pub(crate) fn is_skipped_dir(name: &str) -> bool {
 }
 
 /// Discover removable drives that look like dashcam SD cards. Recognizes
-/// Wolf Box and Thinkware layouts; Miltona's folder structure is unknown
-/// so those cards must be opened manually.
+/// Wolf Box, Thinkware, and 70mai layouts; Miltona's folder structure is
+/// unknown so those cards must be opened manually.
 #[cfg(windows)]
 pub fn find_sd_cards() -> Result<Vec<ImportSource>, AppError> {
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
@@ -204,6 +212,14 @@ pub fn detect_dashcam_kind(path: &Path) -> Option<CameraKind> {
         return Some(CameraKind::Thinkware);
     }
 
+    let seventymai_count = SEVENTYMAI_FOLDERS
+        .iter()
+        .filter(|f| dir_names.iter().any(|d| d == **f))
+        .count();
+    if seventymai_count >= SEVENTYMAI_MIN_MATCH {
+        return Some(CameraKind::SeventyMai);
+    }
+
     None
 }
 
@@ -322,6 +338,33 @@ mod tests {
         fs::create_dir(dir.path().join("cont_rec")).unwrap();
         fs::create_dir(dir.path().join("evt_rec")).unwrap();
         assert_eq!(detect_dashcam_kind(dir.path()), Some(CameraKind::WolfBox));
+    }
+
+    #[test]
+    fn test_seventymai_folder_signature_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in &["Normal", "Event", "Parking", "Lapse", "Photo"] {
+            fs::create_dir(dir.path().join(f)).unwrap();
+        }
+        assert_eq!(detect_dashcam_kind(dir.path()), Some(CameraKind::SeventyMai));
+    }
+
+    #[test]
+    fn test_seventymai_below_threshold() {
+        // Only Normal + Event — below the 4-folder minimum.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Normal")).unwrap();
+        fs::create_dir(dir.path().join("Event")).unwrap();
+        assert_eq!(detect_dashcam_kind(dir.path()), None);
+    }
+
+    #[test]
+    fn test_seventymai_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in &["normal", "EVENT", "Parking", "lapse"] {
+            fs::create_dir(dir.path().join(f)).unwrap();
+        }
+        assert_eq!(detect_dashcam_kind(dir.path()), Some(CameraKind::SeventyMai));
     }
 
     #[test]

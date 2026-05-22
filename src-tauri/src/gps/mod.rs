@@ -2,6 +2,7 @@
 //! `CameraKind` since each dashcam stores GPS in its own proprietary layout.
 
 pub mod miltona;
+pub mod seventy_mai;
 pub mod shenshu;
 
 use crate::archive::{require_db, ArchiveSlot};
@@ -82,6 +83,9 @@ pub fn extract_for_kind(path: &Path, kind: CameraKind) -> Result<Vec<GpsPoint>, 
     match kind {
         CameraKind::WolfBox => shenshu::extract(path),
         CameraKind::Miltona => miltona::extract(path),
+        // 70mai: GPS lives in a GPSData*.txt sidecar at the card root, not
+        // inside the MP4. The decoder locates the log from the clip path.
+        CameraKind::SeventyMai => seventy_mai::extract(path),
         // Thinkware: no GPS decoder (the sample we have contains no GPS
         // data at all). If a GPS-equipped Thinkware model turns up, add a
         // decoder and flip `CameraKind::gps_supported` for that variant.

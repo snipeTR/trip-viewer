@@ -1,19 +1,24 @@
 //! Filename parsing with auto-detection across multiple dashcam formats.
 //!
-//! We try each parser in order (Wolf Box → Thinkware → Miltona → Generic4Channel)
-//! and use the first one that recognizes the filename. This lets the app
+//! We try each parser in order (Wolf Box → Thinkware → Miltona → 70mai →
+//! Generic4Channel) and use the first one that recognizes the filename.
+//! This lets the app
 //! accept footage from any supported dashcam without the user having to
 //! configure anything or rename files.
 
 use crate::error::AppError;
 use crate::model::{LABEL_FRONT, LABEL_INTERIOR, LABEL_REAR};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventMode {
     Normal,
     Event,
+    /// Parking-mode recording (motion- or impact-triggered while parked).
+    Parked,
+    /// Time-lapse recording.
+    Lapse,
     Other(u8),
 }
 
@@ -27,6 +32,7 @@ pub enum CameraKind {
     WolfBox,
     Thinkware,
     Miltona,
+    SeventyMai,
     Generic,
 }
 
@@ -41,6 +47,8 @@ impl CameraKind {
         match self {
             CameraKind::WolfBox => true,
             CameraKind::Miltona => true,
+            // 70mai writes a GPSData*.txt log at the SD card root.
+            CameraKind::SeventyMai => true,
             CameraKind::Thinkware => false,
             // Unknown cameras: optimistically try — we'll get empty points
             // if there's nothing to extract and the UI will show "No GPS data"
@@ -82,13 +90,14 @@ pub fn parse(filename: &str) -> Result<ParsedName, AppError> {
 
 fn parsers() -> Vec<Box<dyn FilenameParser>> {
     // Order matters: put the most specific formats first, most generic last.
-    // Wolf Box, Thinkware, and Miltona all have very distinct shapes so they
-    // can't conflict; the generic 4-channel parser runs last so it only
-    // catches leftovers.
+    // Wolf Box, Thinkware, Miltona, and 70mai all have very distinct shapes
+    // so they can't conflict; the generic 4-channel parser runs last so it
+    // only catches leftovers.
     vec![
         Box::new(WolfBoxParser),
         Box::new(ThinkwareParser),
         Box::new(MiltonaParser),
+        Box::new(SeventyMaiParser),
         Box::new(Generic4ChannelParser),
     ]
 }
@@ -301,6 +310,98 @@ impl FilenameParser for MiltonaParser {
             channel_label,
             group_key,
             camera_kind: CameraKind::Miltona,
+        })
+    }
+}
+
+// ── 70mai ───────────────────────────────────────────────────────────────────
+//
+// 70mai A810 front camera plus the optional RC12 rear camera. Format:
+//   `{PP}{YYYYMMDD}-{HHMMSS}-{SSSSSS}{C}.MP4`
+// Example: `NO20260522-125624-000184F.MP4`
+//   PP = 2-letter mode prefix:
+//        NO = Normal (continuous)   EV = Event (g-sensor)
+//        PA = Parking               LA = time-Lapse
+//   SSSSSS = 6-digit monotonic serial (the F/B pair shares it)
+//   C  = channel letter (F = front A810, B = rear RC12)
+//
+// Files live under per-mode root folders (Normal/, Event/, Parking/,
+// Lapse/), each split into Front/ and Back/ subfolders. The hidden
+// `.s_Front` folders hold low-res proxy clips and are skipped by the
+// scanner like any other dotfile directory.
+
+struct SeventyMaiParser;
+
+impl FilenameParser for SeventyMaiParser {
+    fn parse(&self, filename: &str) -> Option<ParsedName> {
+        let stem = strip_video_ext(filename)?;
+        // Prefix is the first two characters; the rest is the timestamp.
+        if !stem.is_char_boundary(2) {
+            return None;
+        }
+        let (prefix, rest) = stem.split_at(2);
+        let event_mode = match prefix {
+            "NO" => EventMode::Normal,
+            "EV" => EventMode::Event,
+            "PA" => EventMode::Parked,
+            "LA" => EventMode::Lapse,
+            _ => return None,
+        };
+
+        // rest = `YYYYMMDD-HHMMSS-SSSSSSC`
+        let parts: Vec<&str> = rest.split('-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let (date, time, tail) = (parts[0], parts[1], parts[2]);
+
+        // Date: 8 digits YYYYMMDD.
+        if date.len() != 8 || !date.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // Time: 6 digits HHMMSS.
+        if time.len() != 6 || !time.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        // Tail: one or more serial digits followed by a single channel letter.
+        if tail.len() < 2 {
+            return None;
+        }
+        let (serial, chan) = tail.split_at(tail.len() - 1);
+        if serial.is_empty() || !serial.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+
+        // Parse the numeric fields explicitly: chrono's `%Y` is greedy and
+        // won't stop after four digits when format specifiers are adjacent,
+        // so the raw `YYYYMMDD` string can't be handed to `parse_from_str`.
+        let yr: i32 = date[0..4].parse().ok()?;
+        let mo: u32 = date[4..6].parse().ok()?;
+        let da: u32 = date[6..8].parse().ok()?;
+        let hh: u32 = time[0..2].parse().ok()?;
+        let mi: u32 = time[2..4].parse().ok()?;
+        let se: u32 = time[4..6].parse().ok()?;
+        let start_time = NaiveDate::from_ymd_opt(yr, mo, da)?.and_hms_opt(hh, mi, se)?;
+
+        // 70mai names its folders "Front"/"Back"; the rear RC12 maps to the
+        // app's canonical LABEL_REAR so it sorts (see `label_rank`) and
+        // renders like any other rear channel.
+        let channel_label = match chan {
+            "F" => LABEL_FRONT.to_string(),
+            "B" => LABEL_REAR.to_string(),
+            _ => return None,
+        };
+
+        // Front and back of one recording share prefix + timestamp + serial
+        // and differ only in the channel letter, so the key omits it.
+        let group_key = format!("7m:{prefix}{date}-{time}-{serial}");
+
+        Some(ParsedName {
+            start_time,
+            event_mode,
+            channel_label,
+            group_key,
+            camera_kind: CameraKind::SeventyMai,
         })
     }
 }
@@ -582,6 +683,93 @@ mod tests {
             .is_none());
         assert!(MiltonaParser
             .parse("REC_2026_03_06_07_25_52_F.MP4")
+            .is_none());
+    }
+
+    // ── 70mai ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_seventymai_normal_front() {
+        let p = parse("NO20260522-125624-000184F.MP4").unwrap();
+        assert_eq!(p.channel_label, LABEL_FRONT);
+        assert_eq!(p.event_mode, EventMode::Normal);
+        assert_eq!(p.camera_kind, CameraKind::SeventyMai);
+        assert_eq!(
+            p.start_time,
+            NaiveDate::from_ymd_opt(2026, 5, 22)
+                .unwrap()
+                .and_hms_opt(12, 56, 24)
+                .unwrap()
+        );
+        assert!(p.group_key.starts_with("7m:"));
+    }
+
+    #[test]
+    fn parses_seventymai_event_parking_lapse_prefixes() {
+        assert_eq!(
+            parse("EV20260521-142650-000127F.MP4").unwrap().event_mode,
+            EventMode::Event
+        );
+        assert_eq!(
+            parse("PA20260519-143946-000004F.MP4").unwrap().event_mode,
+            EventMode::Parked
+        );
+        assert_eq!(
+            parse("LA20260519-134126-000002F.MP4").unwrap().event_mode,
+            EventMode::Lapse
+        );
+    }
+
+    #[test]
+    fn parses_seventymai_back_channel() {
+        let p = parse("NO20260522-125624-000184B.MP4").unwrap();
+        assert_eq!(p.channel_label, LABEL_REAR);
+        assert_eq!(p.camera_kind, CameraKind::SeventyMai);
+    }
+
+    #[test]
+    fn seventymai_pair_shares_group_key() {
+        let f = parse("NO20260522-125624-000184F.MP4").unwrap();
+        let b = parse("NO20260522-125624-000184B.MP4").unwrap();
+        assert_eq!(f.group_key, b.group_key);
+    }
+
+    #[test]
+    fn seventymai_serial_distinguishes_recordings() {
+        let a = parse("NO20260522-125624-000184F.MP4").unwrap();
+        let b = parse("NO20260522-125624-000185F.MP4").unwrap();
+        assert_ne!(a.group_key, b.group_key);
+    }
+
+    #[test]
+    fn seventymai_rejects_malformed() {
+        assert!(parse("XX20260522-125624-000184F.MP4").is_err()); // bad prefix
+        assert!(parse("NO20261322-125624-000184F.MP4").is_err()); // month 13
+        assert!(parse("NO20260522-125624-000184.MP4").is_err()); // no channel letter
+        assert!(parse("NO20260522-000184F.MP4").is_err()); // missing a segment
+    }
+
+    #[test]
+    fn seventymai_does_not_collide_with_other_parsers() {
+        // 70mai parser must reject the other vendors' shapes…
+        assert!(SeventyMaiParser
+            .parse("2026_03_15_173951_02_F.MP4")
+            .is_none());
+        assert!(SeventyMaiParser
+            .parse("REC_2026_03_06_07_25_52_F.MP4")
+            .is_none());
+        assert!(SeventyMaiParser
+            .parse("FILE211202-151504-000406F.MOV")
+            .is_none());
+        // …and the other parsers must reject the 70mai shape.
+        assert!(WolfBoxParser
+            .parse("NO20260522-125624-000184F.MP4")
+            .is_none());
+        assert!(ThinkwareParser
+            .parse("NO20260522-125624-000184F.MP4")
+            .is_none());
+        assert!(MiltonaParser
+            .parse("NO20260522-125624-000184F.MP4")
             .is_none());
     }
 
