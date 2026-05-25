@@ -50,7 +50,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhCM0MxQTQwNTZDNDg0RTcKUldUbmhNUldRQm84aTZ4R1lDRWQ2L2hCUlBNVkViSEpiaXBGK3NKNUJEWXVtSXEvQlN4cGQwb20K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZGQjkzMUNDMUQzOTc2REIKUldUYmRqa2R6REc1LzFTRmZKMEtFOXRSWFJDYVhrMkNLdTZUVlkvV0V0TlVZSG5hSEdDRTRXUEkK",
       "endpoints": [
         "https://github.com/chrisl8/trip-viewer/releases/latest/download/latest.json"
       ]
