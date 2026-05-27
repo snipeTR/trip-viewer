@@ -1,6 +1,6 @@
 //! Thin wrapper around `std::process::Command` for the ffmpeg binary.
 //!
-//! Three entry points:
+//! Two entry points:
 //! - `probe_ffmpeg(path)` verifies the binary runs and reports whether
 //!   `hevc_nvenc` is available. Called by the Test button in the
 //!   settings dialog.
@@ -14,9 +14,11 @@
 //!   when the segment changes mid-stream, even when the inputs are
 //!   parameter-uniform. The concat filter normalizes streams across
 //!   inputs in the filter graph and survives the same boundaries.
-//! - `generate_black_placeholder(...)` produces a short black-frame
-//!   MP4 used to plug genuine sibling gaps so each per-channel concat
-//!   has a uniform-length stream and the channels stay in sync.
+//!
+//! Missing sibling channels are no longer plugged with black-frame
+//! placeholders — a channel that's off for part of a trip is encoded
+//! from its real footage only, and the player holds + black-overlays it
+//! across the gaps (see `speed_curve::restrict_curve_to_coverage`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -218,6 +220,17 @@ pub struct EncodeArgs<'a> {
     /// thread count near the host's logical-core count instead of N×
     /// oversubscribing it. `None` = let x265 pick its own pool size.
     pub cpu_pool_threads: Option<usize>,
+    /// Force software decode + `scale` (CPU) filter even when `encoder`
+    /// is `HevcNvenc`. NVENC encoding stays GPU-side. Caller sets this
+    /// for jobs whose concat source mixes black-placeholder segments
+    /// with real Wolf Box footage: NVDEC + the auto-inserted `scale_cuda`
+    /// scaler can't reinit when stream parameters shift at the
+    /// placeholder→real boundary (SAR, tbn, even sub-bitstream HEVC SPS
+    /// differences trip it), surfacing as `auto_scaler reinit -38
+    /// ENOSYS`. Software decode tolerates the boundary cleanly. Per-job
+    /// flag rather than a global setting so the common (no-pad) case
+    /// keeps the fast end-to-end CUDA path.
+    pub software_input: bool,
 }
 
 /// Encode one (trip, tier, channel) output. Blocks until the encode
@@ -249,17 +262,54 @@ pub fn encode_trip_channel(
     if let Some(parent) = args.output_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    fs::create_dir_all(args.scratch_dir)
+        .map_err(|e| AppError::Internal(format!("scratch dir create failed: {e}")))?;
 
-    // Remove any stale output file from a previous failed attempt so
-    // ffmpeg doesn't inherit a partial moov atom or confuse muxers.
-    if args.output_path.exists() {
-        let _ = fs::remove_file(args.output_path);
+    // Encode to a temp file inside the per-job scratch dir, then
+    // atomically rename onto `output_path` on success. This way a
+    // failed re-encode (corrupt source, ffmpeg crash, missing sibling,
+    // cancel) never destroys the previous good output — the user
+    // keeps the working timelapse until a replacement is ready. Both
+    // paths live under `<archive>/Timelapses/` (scratch is the `.tmp/`
+    // subtree), so the rename is in-filesystem and atomic.
+    let tmp_output = args.scratch_dir.join("__output.mp4");
+    if tmp_output.exists() {
+        let _ = fs::remove_file(&tmp_output);
     }
 
-    if args.curve.len() <= 1 {
-        encode_single_shot(args, cancel)
+    let tmp_args = EncodeArgs {
+        ffmpeg_path: args.ffmpeg_path,
+        source_paths: args.source_paths,
+        output_path: &tmp_output,
+        tier: args.tier,
+        channel: args.channel,
+        encoder: args.encoder,
+        curve: args.curve,
+        scratch_dir: args.scratch_dir,
+        cpu_pool_threads: args.cpu_pool_threads,
+        software_input: args.software_input,
+    };
+
+    let encode_result = if args.curve.len() <= 1 {
+        encode_single_shot(&tmp_args, cancel)
     } else {
-        encode_multi_window(args, cancel)
+        encode_multi_window(&tmp_args, cancel)
+    };
+
+    match encode_result {
+        Ok(_) => match fs::rename(&tmp_output, args.output_path) {
+            Ok(()) => Ok(args.output_path.to_path_buf()),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_output);
+                Err(AppError::Internal(format!(
+                    "could not move encoded output into place: {e}"
+                )))
+            }
+        },
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_output);
+            Err(e)
+        }
     }
 }
 
@@ -299,12 +349,13 @@ fn encode_single_shot(args: &EncodeArgs<'_>, cancel: &CancelFlag) -> Result<Path
     // encodes in the multi-window path; the single-segment curve's
     // rate determines the speed factor.
     let rate = args.curve.first().map(|s| s.rate).unwrap_or(1);
-    let filter = speed_curve::compose_window_filter(args.encoder.scale_filter(), rate);
+    let scale_filter = if args.software_input { "scale" } else { args.encoder.scale_filter() };
+    let filter = speed_curve::compose_window_filter(scale_filter, rate);
 
     let mut cmd = ffmpeg_command(args.ffmpeg_path);
     apply_loglevel_flags(&mut cmd);
 
-    if args.encoder.needs_cuda_hwaccel() {
+    if args.encoder.needs_cuda_hwaccel() && !args.software_input {
         cmd.arg("-hwaccel")
             .arg("cuda")
             .arg("-hwaccel_output_format")
@@ -382,6 +433,7 @@ fn encode_multi_window(args: &EncodeArgs<'_>, cancel: &CancelFlag) -> Result<Pat
             duration,
             seg.rate,
             args.encoder,
+            args.software_input,
             &window_path,
             args.ffmpeg_path,
             args.cpu_pool_threads,
@@ -482,6 +534,7 @@ fn encode_window(
     window_duration_s: f64,
     rate: u32,
     encoder: Encoder,
+    software_input: bool,
     output: &Path,
     ffmpeg_path: &str,
     cpu_pool_threads: Option<usize>,
@@ -491,12 +544,13 @@ fn encode_window(
         let _ = fs::remove_file(output);
     }
 
-    let filter = speed_curve::compose_window_filter(encoder.scale_filter(), rate);
+    let scale_filter = if software_input { "scale" } else { encoder.scale_filter() };
+    let filter = speed_curve::compose_window_filter(scale_filter, rate);
 
     let mut cmd = ffmpeg_command(ffmpeg_path);
     apply_loglevel_flags(&mut cmd);
 
-    if encoder.needs_cuda_hwaccel() {
+    if encoder.needs_cuda_hwaccel() && !software_input {
         cmd.arg("-hwaccel")
             .arg("cuda")
             .arg("-hwaccel_output_format")
@@ -750,363 +804,9 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join(" | ")
 }
 
-/// Pixel format and color tagging probed off a reference real-channel
-/// file so we can bake the same values into the black placeholders.
-///
-/// Why this matters: ffmpeg initializes the filter graph from the first
-/// concat segment's frame parameters and can't always reinit when the
-/// next segment differs. A `lavfi color=black` placeholder defaults to
-/// `yuv420p` (limited range, no color tags); Wolf Box footage is
-/// `yuvj420p` (full range) with explicit BT.709 (or BT.601 on the
-/// interior cam) color metadata. When the placeholder leads the concat,
-/// the auto_scaler set up for `yuv420p` blows up with -40 ENOSYS the
-/// instant a `yuvj420p` real frame arrives. Matching these fields
-/// keeps the decoded streams parameter-identical.
-#[derive(Debug, Clone)]
-pub struct ColorMetadata {
-    pub pix_fmt: String,
-    pub color_range: Option<String>,
-    pub color_primaries: Option<String>,
-    pub color_trc: Option<String>,
-    pub color_space: Option<String>,
-}
-
-impl ColorMetadata {
-    /// Sane Wolf Box-shaped defaults used when probing fails or the
-    /// stderr line doesn't match the parser. Better to encode a
-    /// placeholder with the most common tags than to bail the whole
-    /// trip — if the assumption is wrong, the auto_scaler reinit will
-    /// still surface as a job failure rather than silent corruption.
-    fn fallback() -> Self {
-        Self {
-            pix_fmt: "yuvj420p".to_string(),
-            color_range: Some("pc".to_string()),
-            color_primaries: Some("bt709".to_string()),
-            color_trc: Some("bt709".to_string()),
-            color_space: Some("bt709".to_string()),
-        }
-    }
-}
-
-/// Probe a real reference file for pix_fmt + color tags by invoking
-/// ffmpeg in a no-op mode (`-i file -t 0 -f null -`). ffmpeg writes
-/// stream info to stderr before bailing on the empty output, which we
-/// parse. Avoids a separate ffprobe dependency (DESIGN.md locks ffprobe
-/// out of the bundle); the user's existing ffmpeg is already configured.
-///
-/// Returns `Ok` with `ColorMetadata::fallback()` even when parsing
-/// fails — this is best-effort and a wrong-but-plausible default beats
-/// failing the encode entirely.
-pub fn probe_color_metadata(ffmpeg_path: &str, file: &Path) -> ColorMetadata {
-    let out = ffmpeg_command(ffmpeg_path)
-        .arg("-hide_banner")
-        .arg("-nostats")
-        .arg("-i")
-        .arg(file)
-        .arg("-t")
-        .arg("0")
-        .arg("-f")
-        .arg("null")
-        .arg("-")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
-    match out {
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            parse_color_metadata(&stderr).unwrap_or_else(ColorMetadata::fallback)
-        }
-        Err(_) => ColorMetadata::fallback(),
-    }
-}
-
-/// Parse a `Stream #...: Video: <codec> ..., <pix_fmt>(<color>...), WxH`
-/// line out of ffmpeg's stderr. The color block inside parens varies:
-/// `(pc)`, `(pc, bt709)`, or `(pc, bt470bg/bt470bg/smpte170m)` — range,
-/// then optionally a slash-tuple of primaries/space/trc (or a single
-/// shared tag). Returns `None` if no Video stream line is found or the
-/// pix_fmt token can't be located.
-fn parse_color_metadata(stderr: &str) -> Option<ColorMetadata> {
-    let line = stderr.lines().find(|l| l.contains("Video:"))?;
-    let after = line.split_once("Video:")?.1.trim();
-
-    // Split on commas at paren-depth zero so the codec descriptor's
-    // own `(profile)` and `(tag / 0xhhh)` pieces don't get chopped.
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut depth: i32 = 0;
-    for ch in after.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' => {
-                depth = (depth - 1).max(0);
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                let trimmed = current.trim();
-                if !trimmed.is_empty() {
-                    tokens.push(trimmed.to_string());
-                }
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    let last = current.trim();
-    if !last.is_empty() {
-        tokens.push(last.to_string());
-    }
-
-    // First pix_fmt-shaped token wins. The codec descriptor sits before
-    // it; the `WxH` resolution token sits after.
-    let pix_prefixes = [
-        "yuv", "yuyv", "yvyu", "uyvy", "uyy", "nv", "rgb", "bgr", "gbr",
-        "gray", "monoblack", "monowhite", "monob", "monow", "pal8", "ya",
-    ];
-    let mut pix_fmt: Option<String> = None;
-    let mut color_block: Option<String> = None;
-    for t in &tokens {
-        let head = t.split('(').next().unwrap_or("").trim();
-        if pix_prefixes.iter().any(|p| head.starts_with(p)) {
-            pix_fmt = Some(head.to_string());
-            if let (Some(open), Some(close)) = (t.find('('), t.rfind(')')) {
-                if close > open + 1 {
-                    color_block = Some(t[open + 1..close].to_string());
-                }
-            }
-            break;
-        }
-    }
-
-    let pix_fmt = pix_fmt?;
-
-    let mut color_range: Option<String> = None;
-    let mut color_primaries: Option<String> = None;
-    let mut color_trc: Option<String> = None;
-    let mut color_space: Option<String> = None;
-
-    if let Some(block) = color_block {
-        let parts: Vec<&str> = block.split(',').map(|s| s.trim()).collect();
-        if let Some(r) = parts.first() {
-            if *r == "pc" || *r == "tv" {
-                color_range = Some((*r).to_string());
-            }
-        }
-        if parts.len() > 1 {
-            let colors = parts[1];
-            let cparts: Vec<&str> = colors.split('/').map(|s| s.trim()).collect();
-            match cparts.len() {
-                1 => {
-                    color_primaries = Some(cparts[0].to_string());
-                    color_trc = Some(cparts[0].to_string());
-                    color_space = Some(cparts[0].to_string());
-                }
-                3 => {
-                    // ffmpeg's avcodec_string prints the 3-tuple as
-                    // primaries/colorspace/trc — not primaries/trc/space
-                    // as the slash order intuitively suggests. Verified
-                    // empirically against the Wolf Box interior cam:
-                    // ffprobe says primaries=bt470bg, space=bt470bg,
-                    // trc=smpte170m and the stream line reads
-                    // `bt470bg/bt470bg/smpte170m`.
-                    color_primaries = Some(cparts[0].to_string());
-                    color_space = Some(cparts[1].to_string());
-                    color_trc = Some(cparts[2].to_string());
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Some(ColorMetadata {
-        pix_fmt,
-        color_range,
-        color_primaries,
-        color_trc,
-        color_space,
-    })
-}
-
-/// Produce a short black-frame MP4 at the target `output` path with
-/// matching codec/resolution/framerate so it can be fed alongside the
-/// real channel files through the ffmpeg concat demuxer.
-///
-/// The concat demuxer requires all inputs to share codec + pixel
-/// format + resolution + framerate, AND the decoded frame parameters
-/// (range/colorspace) need to match the rest of the concat to keep
-/// ffmpeg's auto-scaler from tripping on a reinit it can't perform.
-/// Callers probe a reference real sibling via `mp4_probe` (for
-/// resolution + fps) and `probe_color_metadata` (for pix_fmt + color
-/// tags) and hand those params in here so the placeholder sits flush
-/// with its neighbors in the list.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_black_placeholder(
-    ffmpeg_path: &str,
-    output: &Path,
-    width: u32,
-    height: u32,
-    fps: u32,
-    duration_s: f64,
-    encoder: Encoder,
-    color: &ColorMetadata,
-) -> Result<(), AppError> {
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if output.exists() {
-        let _ = fs::remove_file(output);
-    }
-
-    // `lavfi color=black` defaults to yuv420p; chain a `format=` filter
-    // so the source stream comes out in the reference sibling's pix_fmt
-    // (typically yuvj420p for Wolf Box).
-    let color_arg = format!(
-        "color=black:size={}x{}:rate={}:duration={:.3},format={}",
-        width, height, fps, duration_s, color.pix_fmt,
-    );
-
-    let mut cmd = ffmpeg_command(ffmpeg_path);
-    cmd.arg("-y")
-        .arg("-hide_banner")
-        .arg("-nostats")
-        .arg("-loglevel")
-        .arg("error");
-
-    // Color tags set BEFORE `-i` tag the input stream's frames at the
-    // source. Critical: the same flags placed only after `-c:v` get
-    // half-honored on the NVENC path — `color_range` and `colorspace`
-    // make it through but `color_primaries` and `color_trc` are dropped,
-    // leaving the placeholder partially tagged and still mismatched
-    // against the real Wolf Box footage. Setting them at the input side
-    // means the encoder sees fully-tagged frames and writes them all
-    // through to the bitstream / container.
-    if let Some(r) = &color.color_range {
-        cmd.arg("-color_range").arg(r);
-    }
-    if let Some(p) = &color.color_primaries {
-        cmd.arg("-color_primaries").arg(p);
-    }
-    if let Some(t) = &color.color_trc {
-        cmd.arg("-color_trc").arg(t);
-    }
-    if let Some(s) = &color.color_space {
-        cmd.arg("-colorspace").arg(s);
-    }
-
-    cmd.arg("-f")
-        .arg("lavfi")
-        .arg("-i")
-        .arg(&color_arg)
-        .arg("-an");
-
-    match encoder {
-        Encoder::HevcNvenc => {
-            cmd.arg("-c:v")
-                .arg("hevc_nvenc")
-                .arg("-preset")
-                .arg("p5")
-                .arg("-cq")
-                .arg("26");
-        }
-        Encoder::LibX265 => {
-            cmd.arg("-c:v")
-                .arg("libx265")
-                .arg("-crf")
-                .arg("26")
-                .arg("-preset")
-                .arg("medium")
-                .arg("-x265-params")
-                .arg("log-level=error");
-        }
-    }
-
-    cmd.arg(output).stdout(Stdio::null()).stderr(Stdio::piped());
-
-    let out = cmd
-        .output()
-        .map_err(|e| AppError::Internal(format!("spawn ffmpeg for placeholder failed: {e}")))?;
-    if !out.status.success() {
-        if output.exists() {
-            let _ = fs::remove_file(output);
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(AppError::Internal(format!(
-            "ffmpeg placeholder exited {}: {}",
-            out.status,
-            tail_lines(&stderr, 8),
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env::temp_dir;
-
-    #[test]
-    fn parse_color_metadata_extracts_pix_fmt_and_full_color_tuple() {
-        // Wolf Box front cam (4K, full range, BT.709 across all three).
-        let stderr = "  Stream #0:0[0x1](und): Video: hevc (Main 10) (hev1 / 0x31766568), \
-            yuvj420p(pc, bt709), 3840x2160 [SAR 1:1 DAR 16:9], 25500 kb/s, 30 fps, \
-            30 tbr, 90k tbn (default)\n";
-        let m = parse_color_metadata(stderr).expect("should parse");
-        assert_eq!(m.pix_fmt, "yuvj420p");
-        assert_eq!(m.color_range.as_deref(), Some("pc"));
-        // Single-tag color block expands to all three slots so the
-        // muxer flags get applied uniformly.
-        assert_eq!(m.color_primaries.as_deref(), Some("bt709"));
-        assert_eq!(m.color_trc.as_deref(), Some("bt709"));
-        assert_eq!(m.color_space.as_deref(), Some("bt709"));
-    }
-
-    #[test]
-    fn parse_color_metadata_extracts_split_color_tuple() {
-        // Wolf Box interior cam, observed verbatim: primaries=bt470bg,
-        // space=bt470bg, trc=smpte170m. Print order is primaries/space/
-        // trc per ffmpeg's avcodec_string formatting.
-        let stderr = "Stream #0:0[0x1](eng): Video: hevc (Main) (hvc1 / 0x31637668), \
-            yuvj420p(pc, bt470bg/bt470bg/smpte170m), 1920x1080, 5884 kb/s, \
-            25 fps, 25 tbr, 120k tbn (default)\n";
-        let m = parse_color_metadata(stderr).expect("should parse");
-        assert_eq!(m.pix_fmt, "yuvj420p");
-        assert_eq!(m.color_range.as_deref(), Some("pc"));
-        assert_eq!(m.color_primaries.as_deref(), Some("bt470bg"));
-        assert_eq!(m.color_space.as_deref(), Some("bt470bg"));
-        assert_eq!(m.color_trc.as_deref(), Some("smpte170m"));
-    }
-
-    #[test]
-    fn parse_color_metadata_handles_range_only_block() {
-        let stderr =
-            "Stream #0:0: Video: h264, yuv420p(tv), 1280x720, 30 fps\n";
-        let m = parse_color_metadata(stderr).expect("should parse");
-        assert_eq!(m.pix_fmt, "yuv420p");
-        assert_eq!(m.color_range.as_deref(), Some("tv"));
-        assert!(m.color_primaries.is_none());
-        assert!(m.color_trc.is_none());
-        assert!(m.color_space.is_none());
-    }
-
-    #[test]
-    fn parse_color_metadata_handles_no_color_block() {
-        // Older / untagged files — pix_fmt with no parens after.
-        let stderr =
-            "Stream #0:0: Video: h264, yuv420p, 1280x720, 30 fps\n";
-        let m = parse_color_metadata(stderr).expect("should parse");
-        assert_eq!(m.pix_fmt, "yuv420p");
-        assert!(m.color_range.is_none());
-    }
-
-    #[test]
-    fn parse_color_metadata_returns_none_without_video_stream() {
-        let stderr = "Input #0, mp3, from 'foo.mp3':\n  \
-            Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s\n";
-        assert!(parse_color_metadata(stderr).is_none());
-    }
 
     #[test]
     fn encoder_picks_nvenc_when_available() {
@@ -1122,59 +822,4 @@ mod tests {
         assert!(matches!(Encoder::pick(&caps), Encoder::LibX265));
     }
 
-    /// Integration-lite: runs `generate_black_placeholder` against a
-    /// real ffmpeg binary and verifies the output exists and parses
-    /// as an MP4 with the requested duration. Skipped unless the
-    /// `TRIPVIEWER_FFMPEG` env var points at a working ffmpeg — CI
-    /// doesn't need to bundle ffmpeg just to run unit tests.
-    ///
-    /// Run locally with:
-    ///   $ TRIPVIEWER_FFMPEG=/path/to/ffmpeg cargo test --manifest-path src-tauri/Cargo.toml \
-    ///         --lib timelapse::ffmpeg::tests::placeholder_produces_valid_mp4_with_requested_duration
-    #[test]
-    fn placeholder_produces_valid_mp4_with_requested_duration() {
-        let Ok(ffmpeg) = std::env::var("TRIPVIEWER_FFMPEG") else {
-            eprintln!("[skip] TRIPVIEWER_FFMPEG not set");
-            return;
-        };
-
-        let out = temp_dir().join(format!(
-            "tripviewer-placeholder-test-{}.mp4",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&out);
-
-        // Use libx265 in the test so GPUs aren't required on dev boxes.
-        // The branch tested here is the same `generate_black_placeholder`
-        // entry point the NVENC path uses; only the encoder args differ.
-        generate_black_placeholder(
-            &ffmpeg,
-            &out,
-            640,
-            360,
-            30,
-            2.0,
-            Encoder::LibX265,
-            &ColorMetadata::fallback(),
-        )
-        .expect("placeholder generation should succeed with a real ffmpeg");
-
-        assert!(out.exists(), "placeholder file wasn't written");
-        let size = fs::metadata(&out).unwrap().len();
-        assert!(size > 0, "placeholder file is empty");
-
-        // Probe the output with the project's existing mp4 parser and
-        // check the reported duration lands within 0.1 s of requested.
-        let meta = crate::metadata::mp4_probe::probe(&out)
-            .expect("generated placeholder should parse as MP4");
-        assert!(
-            (meta.duration_s - 2.0).abs() < 0.1,
-            "expected ~2.0 s, got {}",
-            meta.duration_s
-        );
-        assert_eq!(meta.width, 640);
-        assert_eq!(meta.height, 360);
-
-        let _ = fs::remove_file(&out);
-    }
 }

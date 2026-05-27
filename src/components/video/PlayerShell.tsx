@@ -15,6 +15,7 @@ import {
 import {
   activeSegmentAtConcatTime,
   computeTripTime,
+  fallbackCurveForTier,
   seekTripTime,
 } from "../../utils/tripTime";
 import { KeyboardShortcuts } from "../controls/KeyboardShortcuts";
@@ -24,6 +25,7 @@ import { MapPanel } from "../map/MapPanel";
 import { SegmentTagBar } from "../review/SegmentTagBar";
 import { Timeline } from "../timeline/Timeline";
 import { WelcomePanel } from "../welcome/WelcomePanel";
+import { decideShowMap } from "./decideShowMap";
 import { VideoGrid } from "./VideoGrid";
 
 /** Map the backend's F/I/R channel code to the frontend's canonical
@@ -59,6 +61,7 @@ export function PlayerShell() {
   const sourceMode = useStore((s) => s.sourceMode);
   const activeSpeedCurve = useStore((s) => s.activeSpeedCurve);
   const timelapseJobs = useStore((s) => s.timelapseJobs);
+  const tripGpsByTrip = useStore((s) => s.tripGpsByTrip);
 
   // The "real" current segment — from the trip's segment list, based
   // on store.activeSegmentId. Drives SegmentTagBar and MapPanel in
@@ -150,10 +153,36 @@ export function PlayerShell() {
     [activeSegmentForVideo],
   );
 
+  // Per-channel speed curves for the active tier, keyed by label. The
+  // master's curve drives the trip clock; a slave's (possibly gappy)
+  // curve drives its coverage hold + black overlay. Empty in Original
+  // mode. Stable per tier (recomputed only when the tier/jobs change),
+  // so the engine captures it correctly on rebuild.
+  const channelCurves = useMemo(() => {
+    const m = new Map<string, CurveSegment[]>();
+    if (sourceMode === "original" || !trip) return m;
+    const tier = sourceMode;
+    for (const j of timelapseJobs) {
+      if (
+        j.tripId === trip.id &&
+        j.tier === tier &&
+        j.status === "done" &&
+        j.outputPath
+      ) {
+        const curve =
+          parseCurveJson(j.speedCurveJson ?? null) ??
+          fallbackCurveForTier(trip, tier);
+        if (curve) m.set(channelLabelFromCode(j.channel), curve);
+      }
+    }
+    return m;
+  }, [sourceMode, trip, timelapseJobs]);
+
   const engine = useSyncEngine(
     channelRefs,
     channelLabels,
     activeSegmentForVideo?.id ?? null,
+    channelCurves,
   );
 
   /**
@@ -195,22 +224,34 @@ export function PlayerShell() {
       // 2. Resolve the new mode's curve (tier) or clear it (Original).
       let newCurve: CurveSegment[] | null = null;
       if (newMode !== "original") {
-        // Pull any done job's curve for (trip, tier). All three
-        // channels of a given tier share the same curve by design.
-        const job = state.timelapseJobs.find(
-          (j) =>
-            j.tripId === trip.id &&
-            j.tier === newMode &&
-            j.status === "done" &&
-            j.speedCurveJson,
-        );
-        newCurve = parseCurveJson(job?.speedCurveJson ?? null);
-        if (!newCurve) {
-          // Legacy row (pre-curve column) — can't play tiered safely.
-          // User will rebuild-all after this change ships, so this
-          // fallback path shouldn't hit in normal use.
+        // The trip clock follows the MASTER channel's curve, which must
+        // be full-coverage. The master is the first present channel in
+        // F→I→R order (matching the synthetic tier segment), and the
+        // front camera always spans the whole trip. Per-channel slave
+        // curves (which may be gappy) are loaded separately into the
+        // engine via `channelCurves`.
+        const order = ["F", "I", "R"];
+        const masterJob = state.timelapseJobs
+          .filter(
+            (j) =>
+              j.tripId === trip.id &&
+              j.tier === newMode &&
+              j.status === "done" &&
+              j.outputPath,
+          )
+          .sort((a, b) => order.indexOf(a.channel) - order.indexOf(b.channel))[0];
+        if (!masterJob) {
           console.warn(
-            `[player] ${newMode} has no speed curve for trip ${trip.id}; staying on ${oldMode}`,
+            `[player] no done ${newMode} timelapse for trip ${trip.id}; staying on ${oldMode}`,
+          );
+          return;
+        }
+        newCurve =
+          parseCurveJson(masterJob.speedCurveJson ?? null) ??
+          fallbackCurveForTier(trip, newMode);
+        if (!newCurve) {
+          console.warn(
+            `[player] could not build a curve for ${newMode} on trip ${trip.id}; staying on ${oldMode}`,
           );
           return;
         }
@@ -560,9 +601,16 @@ export function PlayerShell() {
   const gpsSupported =
     activeSegmentForUi?.gpsSupported ?? trip?.gpsSupported ?? true;
   const archiveOnly = trip?.archiveOnly === true;
-  // Archive-only trips have no MapPanel because GPS lives with the
-  // source segments, not the timelapse. Always collapse the map slot.
-  const showMap = gpsSupported && !archiveOnly;
+  // Decision rule is in a separate pure function so it's unit-tested
+  // independently of React — see `decideShowMap` for the precedence.
+  // Archive-only trips show the map iff their stitched GPS was
+  // persisted in `trip_gps` (commit de1acb4); older archive-only
+  // trips collapse the map slot because there's no GPS source left.
+  const showMap = decideShowMap({
+    gpsSupported,
+    archiveOnly,
+    archivedGpsPointCount: tripGpsByTrip[trip.id]?.length ?? 0,
+  });
   const gridCols = showMap ? "grid-cols-[2fr_1fr_1fr]" : "grid-cols-[3fr_1fr]";
 
   return (

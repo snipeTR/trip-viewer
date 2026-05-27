@@ -174,6 +174,73 @@ pub fn build_curve(
     out
 }
 
+/// Restrict a trip-level curve to the concat-time ranges a single
+/// channel actually has footage for, producing that channel's
+/// (possibly gappy) curve.
+///
+/// When a camera is off for part of a trip, its timelapse is built from
+/// real footage only — no black filler — so its curve must omit the
+/// missing ranges. Each `covered` range is intersected with the trip
+/// curve segments, carrying each segment's rate; ranges with no footage
+/// simply produce no segment, and the player reads the resulting
+/// non-contiguity as a gap (hold + black overlay) at playback time.
+///
+/// `covered` must be sorted and disjoint; pass *maximal* runs of present
+/// segments (merge adjacent present siblings) so the output curve stays
+/// minimal. A single full-trip range reproduces `trip_curve` exactly.
+pub fn restrict_curve_to_coverage(
+    trip_curve: &[CurveSegment],
+    covered: &[(f64, f64)],
+) -> Vec<CurveSegment> {
+    let mut out: Vec<CurveSegment> = Vec::new();
+    for &(cs, ce) in covered {
+        if ce <= cs {
+            continue;
+        }
+        for seg in trip_curve {
+            let start = seg.concat_start.max(cs);
+            let end = seg.concat_end.min(ce);
+            if end > start {
+                out.push(CurveSegment {
+                    concat_start: start,
+                    concat_end: end,
+                    rate: seg.rate,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.concat_start
+            .partial_cmp(&b.concat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// Collapse the gaps out of a (possibly gappy) channel curve, yielding
+/// a contiguous curve in *source-time* — the timeline of the channel's
+/// gap-closed real-footage source that ffmpeg actually encodes from.
+///
+/// The persisted curve is in concat-time (with gaps where the camera was
+/// off) for the player; the encoder needs the same segments laid back-to-
+/// back from 0 so its per-window `-ss` seeks land in the real source. The
+/// per-segment spans and rates are identical — only the concat positions
+/// shift. A contiguous (full-coverage) curve is returned unchanged.
+pub fn collapse_gaps(curve: &[CurveSegment]) -> Vec<CurveSegment> {
+    let mut out = Vec::with_capacity(curve.len());
+    let mut cursor = 0.0;
+    for seg in curve {
+        let span = seg.concat_end - seg.concat_start;
+        out.push(CurveSegment {
+            concat_start: cursor,
+            concat_end: cursor + span,
+            rate: seg.rate,
+        });
+        cursor += span;
+    }
+    out
+}
+
 /// Render the curve as an ffmpeg `-filter_complex` body. Thin wrapper
 /// that calls `build_curve` then formats each segment into a
 /// `trim/setpts` chain concatenated with the `concat` filter.
@@ -407,6 +474,84 @@ mod tests {
         assert!(json.contains("concatEnd"));
         let parsed: Vec<CurveSegment> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, curve);
+    }
+
+    // ── restrict_curve_to_coverage ────────────────────────────────────
+
+    fn seg(s: f64, e: f64, r: u32) -> CurveSegment {
+        CurveSegment { concat_start: s, concat_end: e, rate: r }
+    }
+
+    // Trip curve used across the coverage tests: 16x with a 1x event at
+    // [60,75], like the player examples.
+    fn trip() -> Vec<CurveSegment> {
+        vec![seg(0.0, 60.0, 16), seg(60.0, 75.0, 1), seg(75.0, 300.0, 16)]
+    }
+
+    #[test]
+    fn restrict_full_coverage_reproduces_trip_curve() {
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 300.0)]);
+        assert_eq!(got, trip());
+    }
+
+    #[test]
+    fn restrict_middle_gap_drops_event_inside_gap() {
+        // Camera off over [30,90] — the [60,75] event is entirely inside
+        // the gap, so it must not appear in the channel's curve.
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 30.0), (90.0, 300.0)]);
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(90.0, 300.0, 16)]);
+    }
+
+    #[test]
+    fn restrict_leading_gap() {
+        let got = restrict_curve_to_coverage(&trip(), &[(90.0, 300.0)]);
+        assert_eq!(got, vec![seg(90.0, 300.0, 16)]);
+    }
+
+    #[test]
+    fn restrict_keeps_partial_event_overlap() {
+        // Coverage ends mid-event: keep the base run and the clipped event.
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 70.0)]);
+        assert_eq!(got, vec![seg(0.0, 60.0, 16), seg(60.0, 70.0, 1)]);
+    }
+
+    #[test]
+    fn collapse_gaps_makes_curve_contiguous_preserving_spans_and_rates() {
+        let gappy = vec![seg(0.0, 30.0, 16), seg(90.0, 300.0, 16)];
+        let got = collapse_gaps(&gappy);
+        // [0,30] stays; [90,300] (span 210) shifts to [30,240].
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(30.0, 240.0, 16)]);
+    }
+
+    #[test]
+    fn collapse_gaps_is_noop_for_contiguous_curve() {
+        assert_eq!(collapse_gaps(&trip()), trip());
+    }
+
+    #[test]
+    fn restrict_then_collapse_full_coverage_is_identity() {
+        // Full-coverage channels must encode and persist exactly as today.
+        let persist = restrict_curve_to_coverage(&trip(), &[(0.0, 300.0)]);
+        let source = collapse_gaps(&persist);
+        assert_eq!(persist, trip());
+        assert_eq!(source, trip());
+    }
+
+    #[test]
+    fn restrict_empty_coverage_is_empty() {
+        assert!(restrict_curve_to_coverage(&trip(), &[]).is_empty());
+        // Degenerate zero-width ranges contribute nothing.
+        assert!(restrict_curve_to_coverage(&trip(), &[(50.0, 50.0)]).is_empty());
+    }
+
+    #[test]
+    fn restrict_output_is_sorted_and_within_coverage() {
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 30.0), (90.0, 300.0)]);
+        for w in got.windows(2) {
+            assert!(w[0].concat_start <= w[1].concat_start);
+        }
+        // Nothing leaks into the [30,90] gap.
+        assert!(got.iter().all(|s| s.concat_end <= 30.0 || s.concat_start >= 90.0));
     }
 
     // ── compose_filter ────────────────────────────────────────────────

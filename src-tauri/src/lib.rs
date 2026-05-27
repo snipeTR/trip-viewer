@@ -291,6 +291,8 @@ pub fn run() {
             timelapse::commands::start_timelapse,
             timelapse::commands::cancel_timelapse,
             timelapse::commands::list_timelapse_jobs,
+            timelapse::commands::prune_orphan_timelapse_files,
+            timelapse::commands::count_orphan_timelapse_files,
             places::commands::list_places,
             places::commands::add_place,
             places::commands::update_place,

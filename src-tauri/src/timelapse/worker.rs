@@ -415,11 +415,11 @@ fn process_item(
         return ProcessOutcome::Failed;
     }
 
-    // Interior/Rear outcomes: Complete → encode as-is.
-    // CameraDoesNotRecord → skip (single-channel cameras).
-    // PadWithBlack → generate placeholder MP4s for the missing
-    // positions so the concat stream stays the expected duration
-    // and stays in sync with the front/interior channels.
+    // Resolve which of this channel's siblings exist. Missing positions
+    // are NOT padded with black — the channel is encoded from its real
+    // footage only and its curve omits the gaps; the player holds +
+    // black-overlays across them. Empty `sources` ⇒ camera never records
+    // this channel ⇒ skip the job.
     let resolution = match resolve_channel_sources(
         &ctx.front_sources,
         &ctx.front_durations,
@@ -465,120 +465,43 @@ fn process_item(
         return ProcessOutcome::Failed;
     }
 
-    let (sources, padded_count) = match resolution {
-        SiblingResolution::Complete(v) => (v, 0usize),
-        SiblingResolution::CameraDoesNotRecord => {
-            sweep_scratch_dir(&scratch_dir);
-            let msg = "no files for this channel (camera may not record it)";
-            eprintln!(
-                "[timelapse] job failed: trip={} tier={} channel={} error={}",
-                item.trip_id,
-                item.tier.as_str(),
-                item.channel.as_str(),
-                msg
-            );
-            let _ = record_failed(db, item, msg);
-            return ProcessOutcome::Failed;
-        }
-        SiblingResolution::PadWithBlack {
-            entries,
-            missing_count,
-            reference_sibling,
-        } => {
-            // Probe one real sibling to match codec/resolution/fps.
-            // Concat demuxer is strict — mismatched params get the
-            // placeholder rejected at encode time.
-            let meta = match crate::metadata::mp4_probe::probe(Path::new(&reference_sibling)) {
-                Ok(m) => m,
-                Err(e) => {
-                    sweep_scratch_dir(&scratch_dir);
-                    let msg = format!(
-                        "failed to probe reference sibling \
-                         {reference_sibling} to size black placeholders: {e}"
-                    );
-                    eprintln!(
-                        "[timelapse] job failed: trip={} tier={} channel={} error={}",
-                        item.trip_id,
-                        item.tier.as_str(),
-                        item.channel.as_str(),
-                        msg
-                    );
-                    let _ = record_failed(db, item, &msg);
-                    return ProcessOutcome::Failed;
-                }
-            };
-            let width = meta.width.max(16);
-            let height = meta.height.max(16);
-            // Simple integer fps. Dashcam footage is almost always
-            // 30/1; NTSC-ish 30000/1001 rounds to 30 which the concat
-            // demuxer accepts via rate-tolerant muxing.
-            let fps = (meta.fps_num / meta.fps_den.max(1)).max(1);
+    if resolution.sources.is_empty() {
+        sweep_scratch_dir(&scratch_dir);
+        let msg = "no files for this channel (camera may not record it)";
+        eprintln!(
+            "[timelapse] job skipped: trip={} tier={} channel={} reason={}",
+            item.trip_id,
+            item.tier.as_str(),
+            item.channel.as_str(),
+            msg
+        );
+        let _ = record_failed(db, item, msg);
+        return ProcessOutcome::Failed;
+    }
+    let ChannelResolution {
+        sources,
+        covered,
+        missing_count,
+    } = resolution;
 
-            // Probe pix_fmt + color tags so the placeholders match
-            // the real files' decoded frame parameters. Without this
-            // match, ffmpeg's auto_scaler trips on a -40 ENOSYS reinit
-            // when the first segment is a placeholder (yuv420p,
-            // untagged) and slot 1 is real Wolf Box footage (yuvj420p,
-            // BT.709 tagged). Falls back to Wolf Box-shaped defaults
-            // if parsing fails.
-            let color_meta =
-                ffmpeg::probe_color_metadata(ffmpeg_path, Path::new(&reference_sibling));
-
-            let mut built: Vec<String> = Vec::with_capacity(entries.len());
-            let mut placeholder_err: Option<AppError> = None;
-            for (i, entry) in entries.into_iter().enumerate() {
-                match entry {
-                    ConcatEntry::Real(s) => built.push(s),
-                    ConcatEntry::MissingPlaceholder { duration_s } => {
-                        let path = scratch_dir.join(format!("ph_{i}.mp4"));
-                        match ffmpeg::generate_black_placeholder(
-                            ffmpeg_path,
-                            &path,
-                            width,
-                            height,
-                            fps,
-                            duration_s,
-                            encoder,
-                            &color_meta,
-                        ) {
-                            Ok(()) => {
-                                built.push(path.to_string_lossy().to_string());
-                            }
-                            Err(e) => {
-                                placeholder_err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(e) = placeholder_err {
-                sweep_scratch_dir(&scratch_dir);
-                let msg = format!("black placeholder generation failed: {e}");
-                eprintln!(
-                    "[timelapse] job failed: trip={} tier={} channel={} error={}",
-                    item.trip_id,
-                    item.tier.as_str(),
-                    item.channel.as_str(),
-                    msg
-                );
-                let _ = record_failed(db, item, &msg);
-                return ProcessOutcome::Failed;
-            }
-            (built, missing_count)
-        }
-    };
-
-    // Build the speed curve once. Used by `encode_trip_channel` to
-    // dispatch single-shot vs multi-window, by `compose_filter` for
-    // the single-shot filter, and by `serialize_curve` for the JSON
-    // metadata persisted on the timelapse_jobs row. One source of
-    // truth for the (trip, tier) speed shape.
-    let curve = crate::timelapse::speed_curve::build_curve(
+    // Build the trip-level curve once, then restrict it to the ranges
+    // THIS channel actually has footage for. `persist_curve` is in
+    // concat-time (gappy where the camera was off) and is what the
+    // player reads to hold + black-overlay across gaps. `source_curve`
+    // collapses those gaps to source-time so the encoder's per-window
+    // `-ss` seeks land in the gap-closed real-footage source. For a
+    // full-coverage channel both equal the trip curve, so the output
+    // and metadata are byte-for-byte what the old path produced.
+    let trip_curve = crate::timelapse::speed_curve::build_curve(
         &ctx.windows,
         item.tier,
         ctx.total_duration_s,
     );
+    let persist_curve = crate::timelapse::speed_curve::restrict_curve_to_coverage(
+        &trip_curve,
+        &covered,
+    );
+    let curve = crate::timelapse::speed_curve::collapse_gaps(&persist_curve);
 
     let output_path = output_root.join(format!(
         "{}_{}_{}.mp4",
@@ -586,6 +509,12 @@ fn process_item(
         item.tier.as_str(),
         item.channel.as_str()
     ));
+
+    // With black placeholders gone, every concat source is now uniform
+    // real Wolf Box footage (same SPS/pix_fmt/colour), so the NVDEC +
+    // scale_cuda path no longer hits the placeholder→real reinit failure
+    // that forced software decode. Keep the fast GPU-only pipeline.
+    let software_input = false;
 
     let args = EncodeArgs {
         ffmpeg_path,
@@ -597,6 +526,7 @@ fn process_item(
         curve: &curve,
         scratch_dir: &scratch_dir,
         cpu_pool_threads,
+        software_input,
     };
     let started = Instant::now();
     let encode_result = ffmpeg::encode_trip_channel(&args, cancel);
@@ -610,7 +540,10 @@ fn process_item(
 
     match encode_result {
         Ok(path) => {
-            let curve_json = crate::timelapse::speed_curve::serialize_curve(&curve);
+            // Persist the concat-time (gappy) curve — that's what the
+            // player maps against. The encoder used the gap-collapsed
+            // source-time curve; never persist that one.
+            let curve_json = crate::timelapse::speed_curve::serialize_curve(&persist_curve);
             let output_size_bytes = std::fs::metadata(&path).ok().map(|m| m.len() as i64);
             if let Err(e) = record_done(
                 db,
@@ -618,7 +551,10 @@ fn process_item(
                 &path,
                 &caps.version,
                 encoder.as_str(),
-                padded_count as i64,
+                // `padded_count` column now records gapped (missing)
+                // segments — no black is baked, but it stays a useful
+                // "how many gaps does this channel have" diagnostic.
+                missing_count as i64,
                 &curve_json,
                 output_size_bytes,
             ) {
@@ -631,12 +567,12 @@ fn process_item(
             // in the app log so a slow encode is greppable after the
             // fact without joining tables.
             eprintln!(
-                "[timelapse] job done: trip={} tier={} channel={} elapsed={:.1}s padded={} segments={}",
+                "[timelapse] job done: trip={} tier={} channel={} elapsed={:.1}s gaps={} segments={}",
                 item.trip_id,
                 item.tier.as_str(),
                 item.channel.as_str(),
                 elapsed.as_secs_f64(),
-                padded_count,
+                missing_count,
                 curve.len()
             );
             ProcessOutcome::Done
@@ -699,6 +635,13 @@ fn record_done(
     speed_curve_json: &str,
     output_size_bytes: Option<i64>,
 ) -> Result<(), AppError> {
+    let archive_root = db.archive_root().to_path_buf();
+    // Store the path archive-relative so it survives drive remounts.
+    // Falls back to the absolute string if the output somehow landed
+    // outside the archive root — better to keep a usable-while-mounted
+    // path than refuse to record the row at all.
+    let stored_path = crate::paths::to_archive_relative(output_path, &archive_root)
+        .unwrap_or_else(|_| output_path.to_string_lossy().to_string());
     let conn = db
         .lock()
         .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
@@ -707,7 +650,7 @@ fn record_done(
         &item.trip_id,
         item.tier.as_str(),
         item.channel.as_str(),
-        &output_path.to_string_lossy(),
+        &stored_path,
         ffmpeg_version,
         encoder_used,
         padded_count,
@@ -861,6 +804,35 @@ pub(crate) fn trip_segment_info(db: &DbHandle, trip_id: &str) -> Result<Vec<Segm
     Ok(out)
 }
 
+/// Append one segment's GPS points to the stitched track, remapping each
+/// to concat-timeline (`cursor + local offset`).
+///
+/// Points whose local `t_offset_s` runs past the segment's video
+/// duration are dropped. Wolf Box parking-mode clips embed GPS for the
+/// whole parked interval (~90 min) into a ~180s video: the `gpmd` track
+/// carries thousands of samples while the video track stays short. Only
+/// the points within the video duration line up with the frames the
+/// concat actually shows; keeping the rest pushes the segment's offsets
+/// far past `cursor`, so the *next* segment's points appear to jump
+/// backwards in concat time. That non-monotonic timeline is what desyncs
+/// the map marker (which advances smoothly) from the video (parked).
+fn append_segment_points(
+    out: &mut Vec<GpsPoint>,
+    cursor: f64,
+    duration_s: f64,
+    points: Vec<GpsPoint>,
+) {
+    for p in points {
+        if p.t_offset_s > duration_s {
+            continue;
+        }
+        out.push(GpsPoint {
+            t_offset_s: cursor + p.t_offset_s,
+            ..p
+        });
+    }
+}
+
 /// Stitch GPS across all segments of a trip, remapping each point's
 /// `t_offset_s` to concat-timeline (cumulative duration of prior
 /// segments). Segments with no GPS contribute no points but still
@@ -872,12 +844,7 @@ pub(crate) fn stitch_trip_gps(segments: &[SegmentInfo]) -> Vec<GpsPoint> {
     for seg in segments {
         let points = gps::extract_for_kind(Path::new(&seg.master_path), seg.camera_kind)
             .unwrap_or_default();
-        for p in points {
-            out.push(GpsPoint {
-                t_offset_s: cursor + p.t_offset_s,
-                ..p
-            });
-        }
+        append_segment_points(&mut out, cursor, seg.duration_s, points);
         cursor += seg.duration_s;
     }
     out
@@ -903,100 +870,71 @@ fn resolve_sibling_path(
     )
 }
 
-/// Outcome of resolving non-Front sibling paths for a trip. The
-/// distinction matters for correctness: a camera that doesn't record
-/// this channel at all (single-channel Miltona, Thinkware-without-rear,
-/// etc.) should skip silently, but a trip with *some* siblings missing
-/// is broken — encoding only the files that exist produces a shorter
-/// concat that falls out of sync with the other channels. That's the
-/// bug the 14-minute rear drift turned out to be.
-/// One entry in the concat list passed to ffmpeg. Either a real
-/// on-disk sibling, or a marker that a black placeholder needs to
-/// be generated of a given duration.
-#[derive(Debug, Clone)]
-pub enum ConcatEntry {
-    Real(String),
-    MissingPlaceholder { duration_s: f64 },
-}
-
-#[derive(Debug)]
-pub enum SiblingResolution {
-    /// Every front segment has a matching sibling on disk.
-    Complete(Vec<String>),
-    /// No siblings exist for this channel (expected for single-channel
-    /// cameras). Caller should skip this (trip, channel) gracefully.
-    CameraDoesNotRecord,
-    /// Some siblings exist and some don't. Caller generates black
-    /// placeholders for the missing positions and proceeds with encode:
-    /// output stays the right duration and in sync with sibling
-    /// channels, but the affected stretches show black.
-    PadWithBlack {
-        entries: Vec<ConcatEntry>,
-        missing_count: usize,
-        /// A real sibling file we can probe (via `mp4_probe`) to get
-        /// codec/resolution/framerate for the placeholders so they
-        /// match the concat demuxer's uniformity requirement.
-        reference_sibling: String,
-    },
+/// Resolution of one channel's sources for a trip: the real sibling
+/// files that exist (gaps omitted, in segment order), the maximal
+/// concat-time ranges they cover, and how many segments were missing.
+///
+/// When a camera is off for part of a trip the missing positions are
+/// NOT padded with black. The channel is encoded from its real footage
+/// only and its persisted curve omits the missing concat-ranges; the
+/// player holds + black-overlays the channel across those gaps at
+/// playback time. No baked black means an alignment/coverage fix never
+/// needs a re-encode — only the curve metadata is regenerated.
+///
+/// `sources` empty means the camera never records this channel
+/// (single-channel Miltona, Thinkware without rear, etc.) — the caller
+/// skips the (trip, channel) job gracefully. A full-coverage channel
+/// (the Front master always is, since `front_sources` *are* the trip's
+/// segments) yields a single `[0, total]` covered range.
+#[derive(Debug, Default)]
+pub struct ChannelResolution {
+    pub sources: Vec<String>,
+    pub covered: Vec<(f64, f64)>,
+    pub missing_count: usize,
 }
 
 /// Resolve sources for one (trip, channel) pair. Walks the trip's
 /// master_paths and probes the requested channel's sibling at each
-/// position, classifying the trip as all-present / all-missing /
-/// partially-missing. The Front channel goes through the same path
-/// as Interior/Rear: when a master happens to be a non-Front file
-/// (e.g. the front camera wasn't recording for the first segment of
-/// a trip), the Front job correctly gets a placeholder for that slot
-/// instead of accidentally concatenating a wrong-channel/wrong-
-/// resolution file into the F output.
+/// position, collecting the real files that exist and the maximal
+/// concat-time ranges they cover (runs of consecutive present
+/// siblings). The concat cursor advances by each segment's duration
+/// whether or not the sibling exists, so covered ranges line up with
+/// the trip's concat timeline.
 fn resolve_channel_sources(
     front_sources: &[String],
     front_durations: &[f64],
     channel: Channel,
-) -> Result<SiblingResolution, AppError> {
+) -> Result<ChannelResolution, AppError> {
     debug_assert_eq!(front_sources.len(), front_durations.len());
 
-    let mut entries: Vec<ConcatEntry> = Vec::with_capacity(front_sources.len());
-    let mut any_present = false;
-    let mut missing_count: usize = 0;
-    let mut reference: Option<String> = None;
+    let mut res = ChannelResolution::default();
+    let mut cursor = 0.0f64;
+    let mut run_start: Option<f64> = None;
 
-    for (path, duration) in front_sources.iter().zip(front_durations.iter()) {
+    for (path, &duration) in front_sources.iter().zip(front_durations.iter()) {
+        let seg_start = cursor;
         match resolve_sibling_path(path, channel)? {
             Some(sibling) => {
-                let s = sibling.to_string_lossy().to_string();
-                if reference.is_none() {
-                    reference = Some(s.clone());
+                res.sources.push(sibling.to_string_lossy().into_owned());
+                if run_start.is_none() {
+                    run_start = Some(seg_start);
                 }
-                entries.push(ConcatEntry::Real(s));
-                any_present = true;
             }
             None => {
-                entries.push(ConcatEntry::MissingPlaceholder { duration_s: *duration });
-                missing_count += 1;
+                res.missing_count += 1;
+                // A gap closes the current covered run at the end of the
+                // previous present segment (== this segment's start).
+                if let Some(rs) = run_start.take() {
+                    res.covered.push((rs, seg_start));
+                }
             }
         }
+        cursor = seg_start + duration;
     }
-
-    if !any_present {
-        return Ok(SiblingResolution::CameraDoesNotRecord);
+    if let Some(rs) = run_start.take() {
+        res.covered.push((rs, cursor));
     }
-    if missing_count == 0 {
-        let paths = entries
-            .into_iter()
-            .filter_map(|e| match e {
-                ConcatEntry::Real(s) => Some(s),
-                ConcatEntry::MissingPlaceholder { .. } => None,
-            })
-            .collect();
-        return Ok(SiblingResolution::Complete(paths));
-    }
-
-    Ok(SiblingResolution::PadWithBlack {
-        entries,
-        missing_count,
-        reference_sibling: reference.expect("any_present ensured we have one"),
-    })
+    Ok(res)
 }
 
 fn build_work_list(
@@ -1023,7 +961,20 @@ fn build_work_list(
     };
 
     let mut work = Vec::new();
+    let mut skipped_archive_only = 0u64;
     for trip_id in &trips {
+        // Archive-only trip guard. Trips whose only segments are
+        // tombstones (or whose segment rows were GC'd because the
+        // originals vanished) have no source files to encode from.
+        // Enqueuing them would call `upsert_pending`, which nulls the
+        // existing row's `output_path`; the encode then fails with
+        // "no segments found for trip" and the on-disk timelapse
+        // becomes invisible in the UI even though the file is still
+        // there. Skip entirely so the existing row stays intact.
+        if !trip_has_source_segments(db, trip_id)? {
+            skipped_archive_only += 1;
+            continue;
+        }
         for tier in tiers {
             for channel in channels {
                 if should_enqueue(db, trip_id, *tier, *channel, scope)? {
@@ -1050,7 +1001,29 @@ fn build_work_list(
             }
         }
     }
+    if skipped_archive_only > 0 {
+        eprintln!(
+            "[timelapse] build_work_list: skipped {skipped_archive_only} archive-only trip(s) (no source segments — existing outputs left intact)"
+        );
+    }
     Ok(work)
+}
+
+/// True when at least one non-tombstone segment row exists for the
+/// trip. Mirrors the filter that `trip_segment_info` applies so the
+/// guard in `build_work_list` matches the worker's source-resolution
+/// semantics exactly.
+fn trip_has_source_segments(db: &DbHandle, trip_id: &str) -> Result<bool, AppError> {
+    let conn = db
+        .lock()
+        .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM segments
+         WHERE trip_id = ?1 AND is_tombstone = 0",
+        params![trip_id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 fn should_enqueue(
@@ -1139,6 +1112,7 @@ pub(crate) fn discover_library_root(conn: &Connection) -> Result<DiscoveredRoot,
     Ok(DiscoveredRoot::SegmentParent(parent.to_path_buf()))
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1138,37 @@ mod tests {
             params![master_path],
         )
         .unwrap();
+    }
+
+    fn gp(t: f64) -> GpsPoint {
+        GpsPoint {
+            t_offset_s: t,
+            lat: 0.0,
+            lon: 0.0,
+            speed_mps: 0.0,
+            heading_deg: 0.0,
+            altitude_m: 0.0,
+            fix_ok: true,
+        }
+    }
+
+    #[test]
+    fn append_segment_points_trims_to_duration_and_offsets() {
+        let mut out = Vec::new();
+        // A parking-mode clip: 180s video, but GPS samples run out to
+        // 5399s (whole parked interval). Only points <= 180 should land.
+        let parking: Vec<GpsPoint> = (0..=5399).map(|s| gp(s as f64)).collect();
+        append_segment_points(&mut out, 0.0, 180.0, parking);
+        assert_eq!(out.len(), 181, "kept points beyond the video duration");
+        assert_eq!(out.first().unwrap().t_offset_s, 0.0);
+        assert_eq!(out.last().unwrap().t_offset_s, 180.0);
+
+        // Next segment starts at cursor=180; its points must not appear
+        // before the trimmed tail of the previous one.
+        append_segment_points(&mut out, 180.0, 60.0, vec![gp(0.0), gp(30.0), gp(60.0)]);
+        let monotonic = out.windows(2).all(|w| w[1].t_offset_s >= w[0].t_offset_s);
+        assert!(monotonic, "stitched concat-timeline went backwards");
+        assert_eq!(out.last().unwrap().t_offset_s, 240.0);
     }
 
     #[test]
@@ -1335,28 +1340,25 @@ mod tests {
             front_b.to_string_lossy().to_string(),
         ];
         let durations = vec![180.0, 180.0];
-        match resolve_channel_sources(&sources, &durations, Channel::Front).unwrap() {
-            SiblingResolution::Complete(got) => {
-                assert_eq!(got.len(), 2);
-                assert!(got.iter().any(|s| s.ends_with("103001_00_F.MP4")));
-                assert!(got.iter().any(|s| s.ends_with("103300_00_F.MP4")));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let r = resolve_channel_sources(&sources, &durations, Channel::Front).unwrap();
+        assert_eq!(r.sources.len(), 2);
+        assert_eq!(r.missing_count, 0);
+        assert!(r.sources.iter().any(|s| s.ends_with("103001_00_F.MP4")));
+        assert!(r.sources.iter().any(|s| s.ends_with("103300_00_F.MP4")));
+        // Full coverage → a single [0, total] range.
+        assert_eq!(r.covered, vec![(0.0, 360.0)]);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_channel_sources_front_pads_when_a_master_is_not_front() {
+    fn resolve_channel_sources_front_gaps_when_a_master_is_not_front() {
         // The 9:43 AM trip case: the first segment's master is a Rear
-        // file (no F existed at that timestamp). The F job for that
-        // trip must place a black-frame placeholder for that slot,
-        // not concatenate the wrong-channel rear file into the F
-        // output (which it used to do via the Front short-circuit and
-        // which trivially fails with filter-reinit -40 because the F
-        // and R cameras record at different resolutions).
-        let dir = unique_dir("front-pads-when-master-is-r");
+        // file (no F existed at that timestamp). The F job leaves that
+        // slot as a coverage gap (no source) rather than concatenating
+        // the wrong-channel rear file into the F output — the player
+        // black-overlays the gap at playback time.
+        let dir = unique_dir("front-gaps-when-master-is-r");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // Segment 1: only a Rear file on disk.
@@ -1372,37 +1374,20 @@ mod tests {
             front_b.to_string_lossy().to_string(),
         ];
         let durations = vec![180.0, 180.0];
-        match resolve_channel_sources(&sources, &durations, Channel::Front).unwrap() {
-            SiblingResolution::PadWithBlack {
-                entries,
-                missing_count,
-                reference_sibling,
-            } => {
-                assert_eq!(missing_count, 1);
-                assert_eq!(entries.len(), 2);
-                // Slot 0 has no F on disk → placeholder.
-                match &entries[0] {
-                    ConcatEntry::MissingPlaceholder { duration_s } => {
-                        assert!((duration_s - 180.0).abs() < 1e-9);
-                    }
-                    other => panic!("expected MissingPlaceholder at slot 0, got {other:?}"),
-                }
-                // Slot 1 has a real F file.
-                assert!(matches!(entries[1], ConcatEntry::Real(_)));
-                // Reference for placeholder dimensions/fps comes from
-                // the real F file, so placeholders match the F camera's
-                // resolution rather than the rear camera's.
-                assert!(reference_sibling.ends_with("_F.MP4"));
-            }
-            other => panic!("expected PadWithBlack, got {other:?}"),
-        }
+        // Segment 0 has no F on disk → coverage gap; segment 1 is real.
+        let r = resolve_channel_sources(&sources, &durations, Channel::Front).unwrap();
+        assert_eq!(r.missing_count, 1);
+        assert_eq!(r.sources.len(), 1);
+        assert!(r.sources[0].ends_with("094634_00_F.MP4"));
+        // Only segment 1 (concat [180, 360)) is covered; [0, 180) is the gap.
+        assert_eq!(r.covered, vec![(180.0, 360.0)]);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_channel_sources_requests_padding_for_partial_miss() {
-        let dir = unique_dir("padmiss");
+    fn resolve_channel_sources_gaps_for_partial_miss() {
+        let dir = unique_dir("gapmiss");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let front_a = dir.join("2026_04_22_103001_00_F.MP4");
@@ -1418,34 +1403,19 @@ mod tests {
             front_b.to_string_lossy().to_string(),
         ];
         let durations = vec![180.0, 175.5];
-        match resolve_channel_sources(&sources, &durations, Channel::Interior).unwrap() {
-            SiblingResolution::PadWithBlack {
-                entries,
-                missing_count,
-                reference_sibling,
-            } => {
-                assert_eq!(missing_count, 1);
-                assert_eq!(entries.len(), 2);
-                assert!(reference_sibling.ends_with("_I.MP4"));
-                // Position 0 should be real (interior_a exists).
-                assert!(matches!(entries[0], ConcatEntry::Real(_)));
-                // Position 1 should be a placeholder carrying the
-                // front segment's duration (175.5 from durations[1]).
-                match &entries[1] {
-                    ConcatEntry::MissingPlaceholder { duration_s } => {
-                        assert!((duration_s - 175.5).abs() < 1e-9);
-                    }
-                    other => panic!("expected MissingPlaceholder, got {other:?}"),
-                }
-            }
-            other => panic!("expected PadWithBlack, got {other:?}"),
-        }
+        // Segment 0 (interior present) is covered; segment 1 (interior
+        // missing) is a gap. durations = [180, 175.5].
+        let r = resolve_channel_sources(&sources, &durations, Channel::Interior).unwrap();
+        assert_eq!(r.missing_count, 1);
+        assert_eq!(r.sources.len(), 1);
+        assert!(r.sources[0].ends_with("_I.MP4"));
+        assert_eq!(r.covered, vec![(0.0, 180.0)]);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn resolve_channel_sources_reports_camera_does_not_record_when_all_missing() {
+    fn resolve_channel_sources_empty_when_camera_never_records() {
         let dir = unique_dir("allmiss");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1455,10 +1425,9 @@ mod tests {
 
         let sources = vec![front.to_string_lossy().to_string()];
         let durations = vec![180.0];
-        match resolve_channel_sources(&sources, &durations, Channel::Rear).unwrap() {
-            SiblingResolution::CameraDoesNotRecord => {}
-            other => panic!("expected CameraDoesNotRecord, got {other:?}"),
-        }
+        let r = resolve_channel_sources(&sources, &durations, Channel::Rear).unwrap();
+        assert!(r.sources.is_empty(), "camera never records this channel");
+        assert!(r.covered.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1482,15 +1451,139 @@ mod tests {
             front_b.to_string_lossy().to_string(),
         ];
         let durations = vec![180.0, 180.0];
-        match resolve_channel_sources(&sources, &durations, Channel::Rear).unwrap() {
-            SiblingResolution::Complete(v) => {
-                assert_eq!(v.len(), 2);
-                assert!(v.iter().any(|s| s.ends_with("2026_04_22_103000_00_R.MP4")));
-                assert!(v.iter().any(|s| s.ends_with("2026_04_22_103302_00_R.MP4")));
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        let r = resolve_channel_sources(&sources, &durations, Channel::Rear).unwrap();
+        assert_eq!(r.sources.len(), 2);
+        assert_eq!(r.missing_count, 0);
+        assert!(r.sources.iter().any(|s| s.ends_with("2026_04_22_103000_00_R.MP4")));
+        assert!(r.sources.iter().any(|s| s.ends_with("2026_04_22_103302_00_R.MP4")));
+        assert_eq!(r.covered, vec![(0.0, 360.0)]);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the upsert_pending bug. An archive-only trip
+    /// (only tombstone segments, but a `done` timelapse_jobs row
+    /// pointing at an on-disk MP4) must be skipped entirely by
+    /// `build_work_list` so the existing row's `output_path` isn't
+    /// nulled out. Before the fix, RebuildAll would enqueue the trip,
+    /// call `upsert_pending` (clearing `output_path`), the encode
+    /// would then fail with "no segments found for trip", and the
+    /// perfectly good on-disk timelapse would become invisible.
+    #[test]
+    fn build_work_list_skips_archive_only_trips_under_rebuild_all() {
+        let scan_dir = unique_dir("buildlist-archive-only");
+        let _ = fs::remove_dir_all(&scan_dir);
+        fs::create_dir_all(&scan_dir).unwrap();
+        let db = crate::db::open_in_memory_with_root(&scan_dir).unwrap();
+
+        let trip_id = "archive-only-trip";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO trips (id, start_time_ms, end_time_ms, camera_kind,
+                    gps_supported, last_seen_ms)
+                 VALUES (?1, 1000, 2000, 'wolfBox', 1, 0)",
+                params![trip_id],
+            )
+            .unwrap();
+            // A tombstone segment — present in the table but excluded
+            // from `trip_segment_info` and from the new guard's count.
+            conn.execute(
+                "INSERT INTO segments (id, trip_id, start_time_ms, duration_s,
+                    master_path, is_event, camera_kind, gps_supported, last_seen_ms,
+                    is_tombstone)
+                 VALUES ('seg-tomb', ?1, 1000, 60.0, '', 0, 'wolfbox', 1, 0, 1)",
+                params![trip_id],
+            )
+            .unwrap();
+            // Pre-existing done row — must survive the call untouched.
+            db::timelapse_jobs::upsert_pending(&conn, trip_id, "8x", "F").unwrap();
+            db::timelapse_jobs::mark_done(
+                &conn,
+                trip_id,
+                "8x",
+                "F",
+                "Timelapses/archive-only-trip_8x_F.mp4",
+                "7.0",
+                "hevc_nvenc",
+                0,
+                "[]",
+                Some(42),
+            )
+            .unwrap();
+        }
+
+        let work = build_work_list(
+            &db,
+            None,
+            &[Tier::Tier8x],
+            &[Channel::Front],
+            JobScope::RebuildAll,
+        )
+        .unwrap();
+        assert!(
+            work.is_empty(),
+            "archive-only trip must contribute no work items"
+        );
+
+        // Critical: output_path is still pointing at the on-disk file.
+        let conn = db.lock().unwrap();
+        let row = db::timelapse_jobs::get(&conn, trip_id, "8x", "F")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, db::timelapse_jobs::STATUS_DONE);
+        assert_eq!(
+            row.output_path.as_deref(),
+            Some("Timelapses/archive-only-trip_8x_F.mp4"),
+            "RebuildAll over an archive-only trip must NOT null output_path"
+        );
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&scan_dir);
+    }
+
+    /// Trips with at least one live (non-tombstone) segment must still
+    /// be enqueued normally under RebuildAll — the guard is precise to
+    /// the archive-only case.
+    #[test]
+    fn build_work_list_enqueues_trips_with_live_segments() {
+        let scan_dir = unique_dir("buildlist-live");
+        let _ = fs::remove_dir_all(&scan_dir);
+        fs::create_dir_all(&scan_dir).unwrap();
+        let db = crate::db::open_in_memory_with_root(&scan_dir).unwrap();
+
+        let trip_id = "live-trip";
+        {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO trips (id, start_time_ms, end_time_ms, camera_kind,
+                    gps_supported, last_seen_ms)
+                 VALUES (?1, 1000, 2000, 'wolfBox', 1, 0)",
+                params![trip_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO segments (id, trip_id, start_time_ms, duration_s,
+                    master_path, is_event, camera_kind, gps_supported, last_seen_ms,
+                    is_tombstone)
+                 VALUES ('seg-live', ?1, 1000, 60.0,
+                         'Videos/2026_04_22_103001_00_F.MP4', 0, 'wolfbox', 1, 0, 0)",
+                params![trip_id],
+            )
+            .unwrap();
+        }
+
+        let work = build_work_list(
+            &db,
+            None,
+            &[Tier::Tier8x],
+            &[Channel::Front],
+            JobScope::RebuildAll,
+        )
+        .unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].trip_id, trip_id);
+
+        let _ = fs::remove_dir_all(&scan_dir);
     }
 }

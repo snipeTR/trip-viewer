@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::app_settings::AppSettingsHandle;
 use crate::archive::{require_db, ArchiveSlot};
@@ -187,7 +187,39 @@ pub async fn start_timelapse(
     let app_clone = app.clone();
     let db_clone = db.clone();
     let state_clone: SharedWorkerState = (*worker_state).clone();
+    let archive_root = db.archive_root().to_path_buf();
     tauri::async_runtime::spawn_blocking(move || {
+        // Refresh the trip/segment tables from disk before encoding so
+        // newly imported (or hand-copied) files show up in the work
+        // list. Without this, users had to remember to click Scan
+        // before Timelapse; new trips were silently skipped because
+        // build_work_list reads from the `trips` table.
+        //
+        // Failure here is logged but not fatal: a stale library
+        // (e.g. archive drive unplugged) still has whatever rows the
+        // last successful scan left behind, and the encode can run on
+        // those rather than refusing to do anything.
+        let _ = app_clone.emit("timelapse:scanning", true);
+        let scan_started_ms = chrono::Utc::now().timestamp_millis();
+        match crate::scan::scan_folder_sync(&archive_root, &archive_root) {
+            Ok(result) => {
+                if let Ok(mut conn) = db_clone.lock() {
+                    if let Err(e) = crate::db::segments::persist_and_gc(
+                        &mut conn,
+                        &result.trips,
+                        scan_started_ms,
+                        &archive_root,
+                    ) {
+                        eprintln!("[timelapse] pre-scan persist_and_gc failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[timelapse] pre-scan failed (continuing with existing DB rows): {e}");
+            }
+        }
+        let _ = app_clone.emit("timelapse:scanning", false);
+
         run_timelapse_loop(
             app_clone,
             db_clone,
@@ -219,13 +251,53 @@ pub async fn cancel_timelapse(
     Ok(())
 }
 
+/// Move every orphan timelapse file under `<archive>/Timelapses/` to
+/// trash. An orphan is a file named `{trip_id}_{tier}_{channel}.mp4`
+/// where `trip_id` matches no row in `timelapse_jobs` — i.e. nothing
+/// in the app references it. Files go to the OS trash so the user can
+/// recover them if needed.
+#[tauri::command]
+pub async fn prune_orphan_timelapse_files(
+    slot: State<'_, ArchiveSlot>,
+) -> Result<crate::timelapse::cleanup::PruneSummary, AppError> {
+    let db = require_db(&slot)?;
+    crate::timelapse::cleanup::prune_orphan_timelapse_files(&db)
+}
+
+/// Read-only orphan count. Used by the frontend to decide whether to
+/// surface the Prune button with a "needs attention" badge — without
+/// this hint, users had no signal that orphans were sitting on disk.
+#[tauri::command]
+pub async fn count_orphan_timelapse_files(
+    slot: State<'_, ArchiveSlot>,
+) -> Result<u64, AppError> {
+    let db = require_db(&slot)?;
+    crate::timelapse::cleanup::count_orphan_timelapse_files(&db)
+}
+
 #[tauri::command]
 pub async fn list_timelapse_jobs(
     slot: State<'_, ArchiveSlot>,
 ) -> Result<Vec<db::timelapse_jobs::TimelapseJobRow>, AppError> {
     let db = require_db(&slot)?;
+    let archive_root = db.archive_root().to_path_buf();
     let conn = db
         .lock()
         .map_err(|_| AppError::Internal("db mutex poisoned".into()))?;
-    db::timelapse_jobs::list_all(&conn)
+    let mut rows = db::timelapse_jobs::list_all(&conn)?;
+    // output_path is stored archive-relative (forward slashes). Rejoin
+    // with the current archive root before handing rows to the frontend
+    // so the video server gets an absolute filesystem path it can open.
+    // Path::join naturally passes any legacy absolute value through
+    // unchanged, which keeps un-migrated DBs functional in dev builds.
+    for row in rows.iter_mut() {
+        if let Some(rel) = row.output_path.as_deref() {
+            row.output_path = Some(
+                crate::paths::from_archive_relative(rel, &archive_root)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(rows)
 }
