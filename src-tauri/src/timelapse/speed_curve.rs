@@ -217,6 +217,63 @@ pub fn restrict_curve_to_coverage(
     out
 }
 
+/// Minimum output length (seconds) for any single curve segment. A
+/// per-window NVENC encode whose output is shorter than this fails to
+/// open ("Error while opening encoder — incorrect parameters such as
+/// bit_rate, rate, width or height"). Empirically ~0.05 s outputs encode
+/// fine and ~0.025 s fail, so 0.1 s leaves a comfortable margin while
+/// staying far too short to perceive any pacing change.
+pub const MIN_WINDOW_OUTPUT_S: f64 = 0.1;
+
+/// Guarantee every segment produces at least `min_output_s` of output
+/// video, so the per-window encoder never chokes on a degenerately short
+/// window. A segment's output length is `span / rate`; coverage-boundary
+/// clipping and closely-spaced event windows can drop that below the
+/// floor (this is what made the gappy 16x/60x rear encodes fail, and is a
+/// latent hazard for any trip with near-adjacent events).
+///
+/// Two cases, neither of which changes a segment's *span* — so the curve
+/// still tiles its coverage exactly and stays aligned with the gap-closed
+/// source the encoder reads:
+///  - A sliver whose *span* is already below `min_output_s` can't reach
+///    the floor even at rate 1, so it's absorbed into the previous
+///    contiguous segment (kept at that segment's rate). Across a gap there
+///    is no previous neighbour, so an isolated sub-floor run is left at
+///    rate 1 — best effort; covered runs are whole clips and in practice
+///    always longer than this.
+///  - Otherwise the rate is lowered just enough that `span / rate >=
+///    min_output_s`. The affected stretch is always shorter than
+///    `min_output_s` of output, so the slight slowdown is invisible.
+pub fn sanitize_for_encode(curve: &[CurveSegment], min_output_s: f64) -> Vec<CurveSegment> {
+    let mut out: Vec<CurveSegment> = Vec::with_capacity(curve.len());
+    for seg in curve {
+        let span = seg.concat_end - seg.concat_start;
+        if span <= 0.0 {
+            continue;
+        }
+        // Absorb a too-short-span sliver into the previous contiguous segment.
+        if span < min_output_s {
+            if let Some(prev) = out.last_mut() {
+                if (seg.concat_start - prev.concat_end).abs() < 1e-6 {
+                    prev.concat_end = seg.concat_end;
+                    continue;
+                }
+            }
+        }
+        // Lower the rate just enough to reach the minimum output length.
+        let mut rate = seg.rate;
+        if (span / rate as f64) < min_output_s {
+            rate = ((span / min_output_s).floor() as u32).clamp(1, seg.rate);
+        }
+        out.push(CurveSegment {
+            concat_start: seg.concat_start,
+            concat_end: seg.concat_end,
+            rate,
+        });
+    }
+    out
+}
+
 /// Collapse the gaps out of a (possibly gappy) channel curve, yielding
 /// a contiguous curve in *source-time* — the timeline of the channel's
 /// gap-closed real-footage source that ffmpeg actually encodes from.
@@ -513,6 +570,50 @@ mod tests {
         // Coverage ends mid-event: keep the base run and the clipped event.
         let got = restrict_curve_to_coverage(&trip(), &[(0.0, 70.0)]);
         assert_eq!(got, vec![seg(0.0, 60.0, 16), seg(60.0, 70.0, 1)]);
+    }
+
+    #[test]
+    fn sanitize_clamps_rate_of_short_high_speed_fragment() {
+        // The May 18 rear failure: an isolated 0.4s covered run at 16x →
+        // 0.025s output → NVENC won't open. Clamp to 0.4/0.1 = 4x.
+        let got = sanitize_for_encode(&[seg(100.0, 100.4, 16)], 0.1);
+        assert_eq!(got, vec![seg(100.0, 100.4, 4)]);
+        // At 60x the same fragment also clamps to 4x.
+        let got60 = sanitize_for_encode(&[seg(100.0, 100.4, 60)], 0.1);
+        assert_eq!(got60, vec![seg(100.0, 100.4, 4)]);
+    }
+
+    #[test]
+    fn sanitize_leaves_long_segments_untouched() {
+        // 6s @ 60x = exactly 0.1s output → at the floor, not below → kept.
+        assert_eq!(
+            sanitize_for_encode(&[seg(0.0, 6.0, 60)], 0.1),
+            vec![seg(0.0, 6.0, 60)]
+        );
+        // A normal long base run is well above the floor.
+        assert_eq!(
+            sanitize_for_encode(&[seg(0.0, 300.0, 16)], 0.1),
+            vec![seg(0.0, 300.0, 16)]
+        );
+    }
+
+    #[test]
+    fn sanitize_absorbs_subfloor_sliver_into_previous_contiguous_segment() {
+        // A 0.02s base sliver between two segments (e.g. event-boundary
+        // clipping) is absorbed into the previous segment, not encoded.
+        let got = sanitize_for_encode(
+            &[seg(0.0, 60.0, 16), seg(60.0, 60.02, 16), seg(60.02, 75.0, 1)],
+            0.1,
+        );
+        assert_eq!(got, vec![seg(0.0, 60.02, 16), seg(60.02, 75.0, 1)]);
+    }
+
+    #[test]
+    fn sanitize_does_not_merge_across_a_gap() {
+        // A sub-floor isolated run after a gap has no contiguous prev, so
+        // it's left at rate 1 (best effort) rather than merged across the gap.
+        let got = sanitize_for_encode(&[seg(0.0, 30.0, 16), seg(90.0, 90.05, 16)], 0.1);
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(90.0, 90.05, 1)]);
     }
 
     #[test]

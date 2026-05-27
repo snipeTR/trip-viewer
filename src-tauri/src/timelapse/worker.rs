@@ -497,9 +497,17 @@ fn process_item(
         item.tier,
         ctx.total_duration_s,
     );
-    let persist_curve = crate::timelapse::speed_curve::restrict_curve_to_coverage(
+    let restricted = crate::timelapse::speed_curve::restrict_curve_to_coverage(
         &trip_curve,
         &covered,
+    );
+    // Guarantee no segment is so short at its rate that the per-window
+    // NVENC encode can't open (coverage-boundary slivers / near-adjacent
+    // events). Applied before deriving both the persisted and source
+    // curves so they stay consistent.
+    let persist_curve = crate::timelapse::speed_curve::sanitize_for_encode(
+        &restricted,
+        crate::timelapse::speed_curve::MIN_WINDOW_OUTPUT_S,
     );
     let curve = crate::timelapse::speed_curve::collapse_gaps(&persist_curve);
 
