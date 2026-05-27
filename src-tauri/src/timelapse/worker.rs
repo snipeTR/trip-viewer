@@ -598,6 +598,15 @@ fn process_item(
                 item.channel.as_str(),
                 e
             );
+            // Remove any stale output left at the canonical path (e.g. a
+            // prior build's file that this attempt didn't overwrite before
+            // failing). Otherwise `relink_present_outputs` sees the stale
+            // file against this now-failed row and silently resurrects it
+            // as "done" — which served the old broken rear timelapse after
+            // the 16x/60x re-encode failed.
+            if output_path.exists() {
+                let _ = std::fs::remove_file(&output_path);
+            }
             let _ = record_failed(db, item, &e.to_string());
             ProcessOutcome::Failed
         }
