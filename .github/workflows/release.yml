@@ -16,10 +16,13 @@ jobs:
             args: ''
           - platform: ubuntu-22.04
             args: ''
-          - platform: macos-15-intel    # Intel (x86_64) — macos-13 was retired 2025-12-08
-            args: ''
-          - platform: macos-latest      # Apple Silicon (aarch64)
-            args: ''
+          # macOS builds require APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD +
+          # APPLE_SIGNING_IDENTITY + APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID
+          # secrets to be set. Uncomment when Apple Developer credentials are available.
+          #- platform: macos-15-intel
+          #  args: ''
+          #- platform: macos-latest
+          #  args: ''
     runs-on: ${{ matrix.platform }}
 
     steps:
