@@ -25,3 +25,7 @@ dist-ssr
 
 # Claude Code local settings
 .claude/
+
+# Tauri signing key files (NEVER commit these)
+tauri_signing_key.key
+tauri_signing_key.pub

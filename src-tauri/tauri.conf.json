@@ -52,7 +52,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZGQjkzMUNDMUQzOTc2REIKUldUYmRqa2R6REc1LzFTRmZKMEtFOXRSWFJDYVhrMkNLdTZUVlkvV0V0TlVZSG5hSEdDRTRXUEkK",
       "endpoints": [
-        "https://github.com/chrisl8/trip-viewer/releases/latest/download/latest.json"
+        "https://github.com/snipeTR/trip-viewer/releases/latest/download/latest.json"
       ]
     }
   }
