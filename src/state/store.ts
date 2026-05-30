@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { GpsPoint, ScanError, Tag, Trip } from "../types/model";
+import type { RecordingMode } from "../utils/recordingMode";
 import type {
   ImportSource,
   ImportPhaseChange,
@@ -74,6 +75,10 @@ export interface LibrarySlice {
    *  `librarySummary.reclaimableTripIds`. Toggled by clicking the
    *  reclaimable count in the sidebar header. */
   reclaimableFilter: boolean;
+  /** Sidebar recording-mode filter. When not "all", TripList shows only
+   *  trips containing at least one segment of the chosen mode (Normal /
+   *  Event / Parking / Time-lapse). Derived from filenames, no DB column. */
+  tripModeFilter: RecordingMode | "all";
   /** False until the first auto-scan (or archive-only merge) on app
    *  start has resolved. The sidebar trip list and welcome panel show
    *  a "Loading library…" placeholder while this is false so the user
@@ -218,6 +223,7 @@ export interface AppState
   refreshLibrarySummary: () => Promise<void>;
   /** Toggle the reclaimable-only filter in the sidebar trip list. */
   setReclaimableFilter: (enabled: boolean) => void;
+  setTripModeFilter: (mode: RecordingMode | "all") => void;
 
   /** IDs of trips the user has flagged for merging. Session-scoped —
    *  not persisted to disk. Once `markedForMerge.size >= 2`, the
@@ -280,6 +286,7 @@ export const useStore = create<AppState>((set) => ({
   tripGpsByTrip: {},
   librarySummary: null,
   reclaimableFilter: false,
+  tripModeFilter: "all",
   libraryFirstLoadDone: false,
   markedForMerge: new Set<string>(),
 
@@ -923,6 +930,7 @@ export const useStore = create<AppState>((set) => ({
     }
   },
   setReclaimableFilter: (reclaimableFilter) => set({ reclaimableFilter }),
+  setTripModeFilter: (tripModeFilter) => set({ tripModeFilter }),
   startTimelapseRun: async (args) => {
     set({
       timelapseRunning: true,

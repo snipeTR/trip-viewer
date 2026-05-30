@@ -298,9 +298,16 @@ fn run_cross_os(
     emit_progress(state, app);
 
     match migration_v2::rebuild_for_cross_os(db, settings) {
-        Ok(_) => with_task(state, TASK_CROSS_OS_REBUILD, |t| {
-            t.status = TaskStatus::Done;
-        }),
+        Ok(outcome) => {
+            if let migration_v2::RebuildOutcome::Migrated { segments_remapped } = outcome {
+                eprintln!(
+                    "[migration_v2] cross-OS rewrite: {segments_remapped} segment(s) remapped"
+                );
+            }
+            with_task(state, TASK_CROSS_OS_REBUILD, |t| {
+                t.status = TaskStatus::Done;
+            });
+        }
         Err(e) => {
             eprintln!("[migration_v2] cross-OS rewrite failed: {e}");
             with_task(state, TASK_CROSS_OS_REBUILD, |t| {

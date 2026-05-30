@@ -8,6 +8,12 @@ import { TripBadges } from "../sidebar/TripBadges";
 import { TripActionsMenu } from "../trip/TripActionsMenu";
 import { MergeTripsDialog } from "../trip/MergeTripsDialog";
 import { formatBytes, formatTripStart } from "../../utils/format";
+import {
+  MODE_LABELS,
+  MODE_ORDER,
+  tripModes,
+  type RecordingMode,
+} from "../../utils/recordingMode";
 
 function formatDuration(trip: Trip): string {
   const total = trip.segments.reduce((sum, s) => sum + s.durationS, 0);
@@ -54,17 +60,35 @@ export function TripList() {
   const reclaimableIds = useStore(
     (s) => s.librarySummary?.reclaimableTripIds ?? null,
   );
+  const tripModeFilter = useStore((s) => s.tripModeFilter);
+  const setTripModeFilter = useStore((s) => s.setTripModeFilter);
   const libraryFirstLoadDone = useStore((s) => s.libraryFirstLoadDone);
   const [showMergeDialog, setShowMergeDialog] = useState(false);
 
   const markedTrips = trips.filter((t) => markedForMerge.has(t.id));
   const canMerge = markedTrips.length >= 2;
 
+  // Recording modes actually present in the library, in canonical order.
+  // The mode filter row only appears when more than one mode exists.
+  const presentModes = useMemo(() => {
+    const seen = new Set<RecordingMode>();
+    for (const t of trips) {
+      for (const m of tripModes(t)) seen.add(m);
+    }
+    return MODE_ORDER.filter((m) => seen.has(m));
+  }, [trips]);
+
   const visibleTrips = useMemo(() => {
-    if (!reclaimableFilter || !reclaimableIds) return trips;
-    const allow = new Set(reclaimableIds);
-    return trips.filter((t) => allow.has(t.id));
-  }, [trips, reclaimableFilter, reclaimableIds]);
+    let result = trips;
+    if (reclaimableFilter && reclaimableIds) {
+      const allow = new Set(reclaimableIds);
+      result = result.filter((t) => allow.has(t.id));
+    }
+    if (tripModeFilter !== "all") {
+      result = result.filter((t) => tripModes(t).has(tripModeFilter));
+    }
+    return result;
+  }, [trips, reclaimableFilter, reclaimableIds, tripModeFilter]);
 
   async function onSelectTrip(tripId: string) {
     selectTrip(tripId);
@@ -137,6 +161,40 @@ export function TripList() {
 
   return (
     <>
+      {presentModes.length > 1 && (
+        <div className="flex flex-wrap gap-1 border-b border-neutral-800 px-2 py-2">
+          <button
+            onClick={() => setTripModeFilter("all")}
+            className={clsx(
+              "rounded px-2 py-0.5 text-xs font-medium",
+              tripModeFilter === "all"
+                ? "bg-blue-600 text-white"
+                : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700",
+            )}
+          >
+            All
+          </button>
+          {presentModes.map((m) => (
+            <button
+              key={m}
+              onClick={() => setTripModeFilter(m)}
+              className={clsx(
+                "rounded px-2 py-0.5 text-xs font-medium",
+                tripModeFilter === m
+                  ? "bg-blue-600 text-white"
+                  : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700",
+              )}
+            >
+              {MODE_LABELS[m]}
+            </button>
+          ))}
+        </div>
+      )}
+      {tripModeFilter !== "all" && visibleTrips.length === 0 && (
+        <p className="px-3 py-4 text-sm text-neutral-500">
+          No {MODE_LABELS[tripModeFilter].toLowerCase()} recordings.
+        </p>
+      )}
       {reclaimableFilter && (
         <div className="mx-2 mt-2 flex items-center gap-2 rounded-md border border-emerald-800 bg-emerald-950/60 px-2 py-1.5 text-xs text-emerald-200">
           <span className="flex-1">
