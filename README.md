@@ -57,7 +57,7 @@ By default on Linux, only the primary channel is shown — press **M** to enable
 
 ## What it does
 
-The app is organized as a top tab bar — **Player**, **Scan**, **Review**, **Timelapse**, optional **Issues**, and **Places** — with a sidebar trip list and storage summary that's always visible.
+The app is organized as a top tab bar — **Player**, **Scan**, **Review**, **Timelapse**, optional **Issues**, and **Places** — with a sidebar trip list and storage summary that's always visible. The sidebar collapses to a thin strip (click the **«** chevron in its header) when you want the video panels as large as possible.
 
 - **Multi-channel synchronized playback (1–4 channels)** — every camera on your dashcam plays in lockstep. Click a side view to make it the main view. Double-click the main view for fullscreen.
 - **Live GPS map** — an OpenStreetMap view tracks your vehicle position in real time as the video plays, with a trail showing where you've been. The map auto-pans to follow the vehicle but holds position during your own drag/zoom gestures so you can inspect a moment without being yanked back.
@@ -67,6 +67,7 @@ The app is organized as a top tab bar — **Player**, **Scan**, **Review**, **Ti
 - **SD card import** — pull footage directly off your dashcam's SD card. Files are copied with SHA-256 integrity verification — with an estimated time remaining during staging — then organized into your library. The SD card is wiped after a successful verified transfer, ready to go back in your dashcam. Safety guards prevent the card from ever being used as its own destination (the import is refused if the source is, contains, or sits inside the library folder), and if a file can't be deleted during the wipe the app stops and asks — **Retry**, **Skip**, or **Cancel wipe** — instead of failing silently. Cancelling the wipe still keeps every copied, verified file in your library.
 - **Import from a folder** — a non-destructive variant for files already on disk (e.g., manually copied off an SD card, or from a backup). Same trip detection and library organization, but nothing is wiped.
 - **Trip detection** — automatically groups your footage into trips based on recording timestamps. No manual organization needed.
+- **Recording-mode filter** — when your dashcam records in more than one mode (e.g. 70mai's Normal / Event / Parking / Time-lapse), the sidebar shows a filter row above the trip list. Click a mode to show only the trips that contain it; click **All** to clear. The mode is read from the filename, so it works the moment you open the library — no extra scan.
 - **Trip operations** — delete a whole trip (originals, timelapses, tags), or mark two or more trips and merge them manually if the auto-segmenter split a trip you wanted kept together.
 - **Originals vs. timelapses** — timelapses are an archival format, not a cache. Deleting a trip's originals leaves its timelapses in place; the trip stays in the library and plays back from the timelapse tier. "Delete trip…" is the only action that removes everything.
 - **Storage usage** — the sidebar shows total bytes used (originals + timelapses) and reclaimable bytes, with a one-click filter to surface the trips whose originals you can drop now that timelapses exist.
