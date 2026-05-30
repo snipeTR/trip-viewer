@@ -412,6 +412,18 @@ fn encode_multi_window(args: &EncodeArgs<'_>, cancel: &CancelFlag) -> Result<Pat
         return Err(e);
     }
 
+    // Probe the prepared source's real duration. The curve is derived
+    // from front-segment durations; if a channel's real footage is even
+    // slightly shorter (clock skew, or a stub sibling that slipped past
+    // the coverage check), a tail window could seek at/after EOF, decode
+    // zero frames, and the CUDA filter never inits → NVENC fails to open
+    // ("hw_frames_ctx must be set" / -22). Clamp every window's seek+len
+    // to the real source so that can never happen. Probe failure → no
+    // clamp (treat as unbounded; preserves prior behavior).
+    let source_dur = crate::metadata::mp4_probe::probe(&source_path)
+        .map(|m| m.duration_s)
+        .unwrap_or(f64::INFINITY);
+
     // Phase 2: per-window encode. Each ffmpeg consumes the prepared
     // source with a fast input seek, scales, applies the segment's
     // rate, and writes a small MP4. Sequential within the job so we
@@ -419,7 +431,19 @@ fn encode_multi_window(args: &EncodeArgs<'_>, cancel: &CancelFlag) -> Result<Pat
     let mut window_paths: Vec<PathBuf> = Vec::with_capacity(args.curve.len());
     let mut window_err: Option<AppError> = None;
     for (i, seg) in args.curve.iter().enumerate() {
-        let duration = (seg.concat_end - seg.concat_start).max(0.0);
+        let mut duration = (seg.concat_end - seg.concat_start).max(0.0);
+        // Skip a window that starts at/after the real source end, and
+        // truncate one that straddles it — either way no zero-frame seek.
+        if seg.concat_start >= source_dur {
+            eprintln!(
+                "[timelapse] skipping window {i} at {:.3}s — past source end {:.3}s",
+                seg.concat_start, source_dur
+            );
+            continue;
+        }
+        if seg.concat_start + duration > source_dur {
+            duration = source_dur - seg.concat_start;
+        }
         if duration <= 0.0 {
             // build_curve drops zero-width segments today, but if a
             // future change leaks one through, skipping it here keeps

@@ -917,6 +917,32 @@ pub struct ChannelResolution {
 /// siblings). The concat cursor advances by each segment's duration
 /// whether or not the sibling exists, so covered ranges line up with
 /// the trip's concat timeline.
+/// A present sibling counts as real coverage only if its actual video
+/// duration is at least this fraction of the front segment's duration.
+/// Wolf Box occasionally writes a degenerate stub sibling (e.g. a 0.1s
+/// rear clip alongside a 180s front segment — a truncated/aborted
+/// recording). Crediting that stub the *front's* full span inflates the
+/// channel's coverage far past its real footage, so the source-time
+/// curve overruns the actual (gap-closed) source file and tail windows
+/// seek past EOF — which makes the per-window NVENC encode fail to open
+/// ("hw_frames_ctx must be set" / -22). Treating such a stub as a gap
+/// keeps coverage honest. 0.5 cleanly separates legitimate clock skew
+/// (~0.99) and matching tiny parking clips from a true stub (~0.0006).
+const MIN_COVERAGE_FRACTION: f64 = 0.5;
+
+/// Decide whether a found sibling counts as coverage. `real_dur` is the
+/// sibling's probed video duration, or `None` if it couldn't be probed
+/// (corrupt/unreadable header) — in which case we keep the historical
+/// "exists ⇒ present" behavior rather than second-guessing. A
+/// successfully-probed sibling shorter than `MIN_COVERAGE_FRACTION` of
+/// its front segment is rejected as a degenerate stub.
+fn sibling_counts_as_covered(real_dur: Option<f64>, front_dur: f64) -> bool {
+    match real_dur {
+        Some(d) => d >= front_dur * MIN_COVERAGE_FRACTION,
+        None => true,
+    }
+}
+
 fn resolve_channel_sources(
     front_sources: &[String],
     front_durations: &[f64],
@@ -930,7 +956,22 @@ fn resolve_channel_sources(
 
     for (path, &duration) in front_sources.iter().zip(front_durations.iter()) {
         let seg_start = cursor;
-        match resolve_sibling_path(path, channel)? {
+        // A sibling that exists but is a degenerate stub (probed duration
+        // far below the front segment) is treated as missing — see
+        // `MIN_COVERAGE_FRACTION`. Probe failures keep "exists ⇒ present".
+        let present = match resolve_sibling_path(path, channel)? {
+            Some(sibling) => {
+                let real_dur =
+                    crate::metadata::mp4_probe::probe(&sibling).map(|m| m.duration_s).ok();
+                if sibling_counts_as_covered(real_dur, duration) {
+                    Some(sibling)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        match present {
             Some(sibling) => {
                 res.sources.push(sibling.to_string_lossy().into_owned());
                 if run_start.is_none() {
@@ -1337,6 +1378,22 @@ mod tests {
         assert!(got.is_none(), "event mode mismatch must block match");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sibling_coverage_rejects_degenerate_stub_keeps_skew_and_unprobed() {
+        // The May 18 bug: a 0.1s rear stub against a 180s front segment.
+        assert!(!sibling_counts_as_covered(Some(0.1), 180.0));
+        // Legitimate clock skew (~0.5% short) stays covered.
+        assert!(sibling_counts_as_covered(Some(179.0), 180.0));
+        // Matching tiny parking clips stay covered.
+        assert!(sibling_counts_as_covered(Some(0.3), 0.4));
+        // Right at the half-duration boundary counts as covered.
+        assert!(sibling_counts_as_covered(Some(90.0), 180.0));
+        assert!(!sibling_counts_as_covered(Some(89.0), 180.0));
+        // Unprobeable sibling (corrupt header / empty test file) keeps
+        // the historical "exists ⇒ present" behavior.
+        assert!(sibling_counts_as_covered(None, 180.0));
     }
 
     #[test]
