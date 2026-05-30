@@ -92,6 +92,11 @@ export class SyncEngine {
   // Slaves WE paused for a coverage gap — so global pause/play and gap
   // hold/resume don't fight over the same element.
   private gapPaused: Set<HTMLVideoElement> = new Set();
+  // Per-slave "currently inside a coverage gap" state, so the gap loop
+  // can act only on covered↔gap *transitions* (re-anchor + pause/resume)
+  // and otherwise leave a covered slave free-running — no per-tick seeks,
+  // which would thrash the WebKitGTK pipeline.
+  private slaveInGap: boolean[];
 
   /** Total concat-seconds a curve covers (sum of segment spans). A
    *  full-coverage channel covers the whole trip; a gappy one covers
@@ -120,6 +125,7 @@ export class SyncEngine {
       if (!c || c.length === 0) return false;
       return SyncEngine.concatSpan(c) < masterSpan - 1.0;
     });
+    this.slaveInGap = this.slaves.map(() => false);
     this.attachPauseGuard();
     this.attachTimeUpdate();
     this.attachStallWatchdog();
@@ -210,32 +216,14 @@ export class SyncEngine {
       const playing = store.isPlaying;
       for (let i = 0; i < this.slaves.length; i++) {
         const curve = this.slaveCurves[i];
-        if (!curve || curve.length === 0) continue; // full-coverage slave
-        const slave = this.slaves[i];
-        const label = this.slaveLabels[i];
-        const covered = coverageAt(concatT, curve).covered;
-        if (!covered) {
-          // In a gap: hold the slave on its last covered frame and show
-          // black. The file is gap-closed, so it's already sitting where
-          // playback resumes — no seek.
-          if (!slave.paused) {
-            this.gapPaused.add(slave);
-            try {
-              slave.pause();
-            } catch {
-              /* best-effort */
-            }
-          }
-          store.setChannelGapped(label, true);
-        } else {
-          store.setChannelGapped(label, false);
-          if (this.gapPaused.has(slave)) {
-            this.gapPaused.delete(slave);
-            // Resume only while globally playing. Un-pausing is a
-            // contiguous continuation (no seek) — validated smooth on
-            // WebKitGTK by the hold/resume spike.
-            if (playing && slave.paused) slave.play().catch(() => {});
-          }
+        if (!curve || curve.length === 0) continue; // no curve → shares master axis
+        const cov = coverageAt(concatT, curve);
+        // Act only on transitions. Steady covered → free-run (no seek);
+        // steady gap → stay held.
+        if (!cov.covered && !this.slaveInGap[i]) {
+          this.enterGap(i, cov.fileTime);
+        } else if (cov.covered && this.slaveInGap[i]) {
+          this.exitGap(i, cov.fileTime, playing);
         }
       }
     };
@@ -245,6 +233,36 @@ export class SyncEngine {
     tick(); // paint the opening frame's coverage immediately
   }
 
+  /** A slave entered a coverage gap. Snap it back to its last covered
+   *  frame (`fileTime` is the gap's leading edge per `coverageAt`),
+   *  undoing any overshoot the free-running element accumulated since
+   *  the boundary, then pause + black-overlay. */
+  private enterGap(i: number, fileTime: number): void {
+    const slave = this.slaves[i];
+    this.slaveInGap[i] = true;
+    if (Number.isFinite(fileTime)) slave.currentTime = fileTime;
+    this.gapPaused.add(slave);
+    try {
+      slave.pause();
+    } catch {
+      /* best-effort */
+    }
+    useStore.getState().setChannelGapped(this.slaveLabels[i], true);
+  }
+
+  /** A slave left a coverage gap. Re-anchor to its own file-time for
+   *  this concat moment (the gap-closed file's next frame), then resume
+   *  if globally playing. The one seek per boundary is masked by the
+   *  black→video transition; steady covered playback never seeks. */
+  private exitGap(i: number, fileTime: number, playing: boolean): void {
+    const slave = this.slaves[i];
+    this.slaveInGap[i] = false;
+    this.gapPaused.delete(slave);
+    if (Number.isFinite(fileTime)) slave.currentTime = fileTime;
+    useStore.getState().setChannelGapped(this.slaveLabels[i], false);
+    if (playing && slave.paused) slave.play().catch(() => {});
+  }
+
   private attachPauseGuard(): void {
     const m = this.master;
     const onPause = () => {
@@ -252,7 +270,9 @@ export class SyncEngine {
       const { isPlaying } = useStore.getState();
       if (isPlaying && m.paused && !m.ended) {
         m.play().then(() => {
-          this.slaves.forEach((s) => {
+          this.slaves.forEach((s, i) => {
+            // Leave gap-held slaves paused — see play().
+            if (this.slaveInGap[i]) return;
             if (s.paused && !s.ended) s.play().catch(() => {});
           });
         }).catch(() => {});
@@ -369,7 +389,14 @@ export class SyncEngine {
       this.master.playbackRate = speed;
       this.slaves.forEach((s) => (s.playbackRate = speed));
       await this.master.play();
-      await Promise.all(this.slaves.map((s) => s.play()));
+      // Don't un-pause a slave that's currently held in a coverage gap —
+      // it must stay paused (black) until its gap ends. The gap loop
+      // resumes it on the covered transition.
+      await Promise.all(
+        this.slaves.map((s, i) =>
+          this.slaveInGap[i] ? Promise.resolve() : s.play(),
+        ),
+      );
       useStore.getState().setIsPlaying(true);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") return;
@@ -387,13 +414,56 @@ export class SyncEngine {
     useStore.getState().setIsPlaying(false);
   }
 
+  // `t` is a position on the MASTER's time axis (file-time in tiered
+  // mode, segment-local in Original). Channels do NOT share one axis once
+  // per-channel curves exist: a gappy rear lives on its own (shorter)
+  // file-time. So we map the master position to the shared concat-time
+  // (trip clock) and position every slave independently through its own
+  // curve. Without this, seeking/tier-switching sent slaves to the
+  // master's file-time and the rear landed somewhere unrelated.
   seek(t: number): void {
     const duration = Number.isFinite(this.master.duration)
       ? this.master.duration
       : Infinity;
     const clamped = Math.min(Math.max(0, t), duration);
     this.master.currentTime = clamped;
-    this.slaves.forEach((s) => (s.currentTime = clamped));
+
+    if (!this.masterCurve || this.masterCurve.length === 0) {
+      // Original mode: all channels share the segment-local axis.
+      this.slaves.forEach((s) => (s.currentTime = clamped));
+      useStore.getState().setCurrentTime(clamped);
+      return;
+    }
+
+    const concatT = fileToConcat(clamped, this.masterCurve);
+    const store = useStore.getState();
+    const playing = store.isPlaying;
+    for (let i = 0; i < this.slaves.length; i++) {
+      const slave = this.slaves[i];
+      const curve = this.slaveCurves[i];
+      if (!curve || curve.length === 0) {
+        slave.currentTime = clamped; // full-coverage, no curve info
+        continue;
+      }
+      const cov = coverageAt(concatT, curve);
+      if (Number.isFinite(cov.fileTime)) slave.currentTime = cov.fileTime;
+      this.slaveInGap[i] = !cov.covered;
+      this.slaveLabels[i] &&
+        store.setChannelGapped(this.slaveLabels[i], !cov.covered);
+      if (cov.covered) {
+        this.gapPaused.delete(slave);
+        if (playing && slave.paused) slave.play().catch(() => {});
+      } else {
+        this.gapPaused.add(slave);
+        if (!slave.paused) {
+          try {
+            slave.pause();
+          } catch {
+            /* best-effort */
+          }
+        }
+      }
+    }
     useStore.getState().setCurrentTime(clamped);
   }
 
