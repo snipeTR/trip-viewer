@@ -8,6 +8,7 @@ import {
   onImportProgress,
   onImportWarning,
   onImportUnknowns,
+  onImportWipeError,
   onImportComplete,
 } from "../../ipc/importer";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -44,6 +45,11 @@ export function ImportConfirmDialog() {
     unlisteners.push(
       onImportUnknowns((unknowns) => {
         useStore.getState().setImportUnknowns(unknowns);
+      }),
+    );
+    unlisteners.push(
+      onImportWipeError((wipeError) => {
+        useStore.getState().setImportWipeError(wipeError);
       }),
     );
     unlisteners.push(

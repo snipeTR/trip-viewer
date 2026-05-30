@@ -7,6 +7,8 @@ import type {
   ImportWarning,
   UnknownFile,
   UnknownFileDecision,
+  WipeError,
+  WipeErrorAction,
   ImportResult,
 } from "../types/import";
 
@@ -66,6 +68,16 @@ export function onImportUnknowns(
   cb: (e: UnknownFile[]) => void,
 ): Promise<UnlistenFn> {
   return listen<UnknownFile[]>("import:unknowns", (e) => cb(e.payload));
+}
+
+export function resolveWipeError(action: WipeErrorAction): Promise<void> {
+  return invoke("resolve_wipe_error", { action });
+}
+
+export function onImportWipeError(
+  cb: (e: WipeError) => void,
+): Promise<UnlistenFn> {
+  return listen<WipeError>("import:wipeError", (e) => cb(e.payload));
 }
 
 export function onImportComplete(

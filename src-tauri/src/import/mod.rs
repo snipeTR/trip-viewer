@@ -20,7 +20,7 @@ use std::time::Duration;
 use tauri::Emitter;
 use types::{
     ImportPhase, ImportPhaseChange, ImportResult, ImportSource, ImportWarning, SourceResult,
-    UnknownFileDecision,
+    UnknownFileDecision, WipeErrorAction,
 };
 
 /// Managed state for the import pipeline.
@@ -29,6 +29,8 @@ pub struct ImportState {
     running: Arc<AtomicBool>,
     unknown_sender: Arc<Mutex<Option<mpsc::Sender<Vec<UnknownFileDecision>>>>>,
     unknown_receiver: Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
+    wipe_error_sender: Arc<Mutex<Option<mpsc::Sender<WipeErrorAction>>>>,
+    wipe_error_receiver: Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
 }
 
 impl ImportState {
@@ -38,6 +40,8 @@ impl ImportState {
             running: Arc::new(AtomicBool::new(false)),
             unknown_sender: Arc::new(Mutex::new(None)),
             unknown_receiver: Arc::new(Mutex::new(None)),
+            wipe_error_sender: Arc::new(Mutex::new(None)),
+            wipe_error_receiver: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -60,6 +64,21 @@ pub async fn start_import(
         return Err(AppError::ImportAlreadyRunning);
     }
 
+    // Refuse any source that IS, contains, or sits inside the destination
+    // library. SD-card import wipes the source after staging; if the source
+    // overlaps the library, the wipe would delete the staged copies (and the
+    // DB/logs) along with the originals — total data loss. This is the same
+    // guard `start_folder_import` applies; SD import needs it too because the
+    // user can point the library folder at the card itself.
+    let resolved_root = resolve_library_root(&root_path);
+    for source in &sources {
+        let source_pb = PathBuf::from(&source.path);
+        if let Err(e) = guard_against_self_import(&source_pb, &resolved_root) {
+            state.running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    }
+
     // Reset cancel flag
     state.cancel_flag.store(false, Ordering::SeqCst);
 
@@ -68,9 +87,15 @@ pub async fn start_import(
     *state.unknown_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(tx);
     *state.unknown_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(rx);
 
+    // Set up channel for wipe-error decisions (retry/skip/cancel prompts).
+    let (wtx, wrx) = mpsc::channel::<WipeErrorAction>();
+    *state.wipe_error_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wtx);
+    *state.wipe_error_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wrx);
+
     let cancel_flag = state.cancel_flag.clone();
     let running = state.running.clone();
     let unknown_receiver = state.unknown_receiver.clone();
+    let wipe_error_receiver = state.wipe_error_receiver.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         // SD-card import is destructive on success: wipe_eligible=true.
@@ -78,6 +103,7 @@ pub async fn start_import(
             &app,
             &cancel_flag,
             &unknown_receiver,
+            &wipe_error_receiver,
             &root_path,
             &sources,
             true,
@@ -139,6 +165,12 @@ pub async fn start_folder_import(
     *state.unknown_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(tx);
     *state.unknown_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(rx);
 
+    // Folder import never wipes, but set up the channel anyway so the
+    // pipeline signature is uniform; the receiver simply goes unused.
+    let (wtx, wrx) = mpsc::channel::<WipeErrorAction>();
+    *state.wipe_error_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wtx);
+    *state.wipe_error_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wrx);
+
     // Synthesize an ImportSource. file_count/total_bytes are populated
     // by the stage phase's own walk; we leave them zero here (the
     // folder-import flow skips the SD-card confirm dialog where they'd
@@ -160,6 +192,7 @@ pub async fn start_folder_import(
     let cancel_flag = state.cancel_flag.clone();
     let running = state.running.clone();
     let unknown_receiver = state.unknown_receiver.clone();
+    let wipe_error_receiver = state.wipe_error_receiver.clone();
     let sources = vec![synthetic];
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -168,6 +201,7 @@ pub async fn start_folder_import(
             &app,
             &cancel_flag,
             &unknown_receiver,
+            &wipe_error_receiver,
             &root_path,
             &sources,
             false,
@@ -254,6 +288,28 @@ pub async fn resolve_unknowns(
     }
 }
 
+/// Provide the user's decision for a failed wipe delete, unblocking the
+/// wipe phase. Mirrors `resolve_unknowns`.
+#[tauri::command]
+pub async fn resolve_wipe_error(
+    state: tauri::State<'_, ImportState>,
+    action: WipeErrorAction,
+) -> Result<(), AppError> {
+    let sender = state
+        .wipe_error_sender
+        .lock()
+        .map_err(|e| AppError::Internal(format!("lock error: {e}")))?;
+
+    match sender.as_ref() {
+        Some(tx) => {
+            tx.send(action)
+                .map_err(|e| AppError::Internal(format!("channel send error: {e}")))?;
+            Ok(())
+        }
+        None => Err(AppError::NoImportRunning),
+    }
+}
+
 // ── Pipeline orchestration ──
 
 /// Run the full import pipeline against one or more sources.
@@ -268,6 +324,7 @@ fn run_pipeline(
     app: &tauri::AppHandle,
     cancel_flag: &AtomicBool,
     unknown_receiver: &Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
+    wipe_error_receiver: &Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
     root_path: &str,
     sources: &[ImportSource],
     wipe_eligible: bool,
@@ -339,6 +396,7 @@ fn run_pipeline(
             &mut config,
             cancel_flag,
             unknown_receiver,
+            wipe_error_receiver,
             app,
             &mut logger,
             wipe_eligible,
@@ -368,6 +426,7 @@ fn process_source(
     config: &mut ImportConfig,
     cancel_flag: &AtomicBool,
     unknown_receiver: &Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
+    wipe_error_receiver: &Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
     app: &tauri::AppHandle,
     logger: &mut ImportLogger,
     wipe_eligible: bool,
@@ -414,7 +473,7 @@ fn process_source(
         && !cancel_flag.load(Ordering::Relaxed)
         && !source.read_only
     {
-        match wipe::wipe_source(source, cancel_flag, app, logger) {
+        match wipe::wipe_source(source, cancel_flag, wipe_error_receiver, app, logger) {
             Ok(()) => result.source_wiped = true,
             Err(e) => {
                 logger.warn(&format!("Wipe failed: {e}"));

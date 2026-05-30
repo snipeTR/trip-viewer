@@ -35,6 +35,14 @@ export interface ImportWarning {
   sourceLabel: string;
 }
 
+export interface WipeError {
+  path: string;
+  error: string;
+  sourceLabel: string;
+}
+
+export type WipeErrorAction = "retry" | "skip" | "cancel";
+
 export interface UnknownFile {
   stagedPath: string;
   relPath: string;

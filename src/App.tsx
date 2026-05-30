@@ -13,6 +13,7 @@ import { ImportButton } from "./components/import/ImportButton";
 import { ImportConfirmDialog } from "./components/import/ImportConfirmDialog";
 import { ImportProgress } from "./components/import/ImportProgress";
 import { UnknownFilesDialog } from "./components/import/UnknownFilesDialog";
+import { WipeErrorDialog } from "./components/import/WipeErrorDialog";
 import { ImportSummary } from "./components/import/ImportSummary";
 import { IssuesView } from "./components/issues/IssuesView";
 import { ScanView } from "./components/scan/ScanView";
@@ -348,6 +349,7 @@ function App() {
     )}
     <ImportConfirmDialog />
     <UnknownFilesDialog />
+    <WipeErrorDialog />
     <ImportSummary />
     <UpdateChecker />
     </>

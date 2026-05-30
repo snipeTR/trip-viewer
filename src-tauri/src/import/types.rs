@@ -87,6 +87,34 @@ pub struct UnknownFileDecision {
     pub action: UnknownFileAction,
 }
 
+// ── Wipe Errors ──
+
+/// Emitted when deleting a file during the wipe phase fails. The pipeline
+/// blocks until the user responds via `resolve_wipe_error`, mirroring the
+/// unknown-files prompt. This prevents a single locked/undeletable file
+/// (e.g. an open log) from silently aborting the wipe.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WipeError {
+    pub path: String,
+    pub error: String,
+    pub source_label: String,
+}
+
+/// The user's choice when a wipe delete fails.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WipeErrorAction {
+    /// Try deleting the same file again.
+    Retry,
+    /// Leave this file on the card and move on to the next.
+    Skip,
+    /// Stop wiping entirely (the rest of the card is left intact). The
+    /// import still proceeds to distribute the already-staged copies, so
+    /// no footage is lost.
+    Cancel,
+}
+
 // ── Import Result ──
 
 #[derive(Debug, Clone, Serialize)]

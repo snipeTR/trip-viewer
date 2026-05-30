@@ -34,8 +34,23 @@ const THINKWARE_MIN_MATCH: usize = 2;
 const SEVENTYMAI_FOLDERS: &[&str] = &["normal", "event", "parking", "lapse", "photo"];
 const SEVENTYMAI_MIN_MATCH: usize = 4;
 
-/// System directories to skip during file counting.
-const SKIPPED_DIRS: &[&str] = &["system volume information", "$recycle.bin"];
+/// Directories to skip during file counting, staging, and wiping.
+///
+/// The first two are OS bookkeeping. The dot-prefixed entries are Trip
+/// Viewer's own library management folders — they only ever appear at a
+/// destination library root, never on a real dashcam card, but skipping
+/// them is a safety backstop: if a source ever overlaps the library (e.g.
+/// the user pointed the library at the card itself), the wipe must never
+/// touch the staged copies, the database, or the active log file. The
+/// self-import guard in `start_import` prevents that overlap up front;
+/// this list is defense-in-depth in case it's ever bypassed.
+const SKIPPED_DIRS: &[&str] = &[
+    "system volume information",
+    "$recycle.bin",
+    ".staging",
+    ".tripviewer",
+    ".logs",
+];
 
 pub(crate) fn is_skipped_dir(name: &str) -> bool {
     let lower = name.to_lowercase();

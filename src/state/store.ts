@@ -6,6 +6,7 @@ import type {
   ImportProgress,
   ImportWarning,
   UnknownFile,
+  WipeError,
   ImportResult,
 } from "../types/import";
 import type { TagsSlice } from "./tagsSlice";
@@ -115,6 +116,7 @@ export type ImportStatus =
   | "confirming"
   | "running"
   | "paused_unknowns"
+  | "paused_wipe_error"
   | "complete"
   | "error";
 
@@ -125,6 +127,7 @@ export interface ImportSlice {
   importProgress: ImportProgress | null;
   importWarnings: ImportWarning[];
   importUnknowns: UnknownFile[];
+  importWipeError: WipeError | null;
   importResult: ImportResult | null;
   importError: string | null;
   importRootPath: string | null;
@@ -135,6 +138,7 @@ export interface ImportSlice {
   setImportProgress: (progress: ImportProgress | null) => void;
   addImportWarning: (w: ImportWarning) => void;
   setImportUnknowns: (files: UnknownFile[]) => void;
+  setImportWipeError: (e: WipeError | null) => void;
   setImportResult: (result: ImportResult | null) => void;
   setImportError: (e: string | null) => void;
   setImportRootPath: (path: string | null) => void;
@@ -300,6 +304,7 @@ export const useStore = create<AppState>((set) => ({
   importProgress: null,
   importWarnings: [],
   importUnknowns: [],
+  importWipeError: null,
   importResult: null,
   importError: null,
   importRootPath: null,
@@ -345,6 +350,13 @@ export const useStore = create<AppState>((set) => ({
     set((s) => ({ importWarnings: [...s.importWarnings, w] })),
   setImportUnknowns: (importUnknowns) =>
     set({ importUnknowns, importStatus: "paused_unknowns" }),
+  setImportWipeError: (importWipeError) =>
+    set((s) => ({
+      importWipeError,
+      // Pause the UI on a new error; clearing (null) leaves the status the
+      // resolver already set back to "running".
+      importStatus: importWipeError ? "paused_wipe_error" : s.importStatus,
+    })),
   setImportResult: (importResult) =>
     set({ importResult, importStatus: importResult ? "complete" : "idle" }),
   setImportError: (importError) =>
@@ -358,6 +370,7 @@ export const useStore = create<AppState>((set) => ({
       importProgress: null,
       importWarnings: [],
       importUnknowns: [],
+      importWipeError: null,
       importResult: null,
       importError: null,
       importRootPath: null,
