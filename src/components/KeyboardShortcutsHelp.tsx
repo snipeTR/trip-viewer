@@ -1,3 +1,9 @@
+import { useState } from "react";
+
+/** localStorage flag: when "1", the shortcuts overlay does NOT auto-open
+ *  on startup. Toggled by the checkbox in this dialog. */
+export const SKIP_SHORTCUTS_KEY = "tripviewer.skipShortcutsOnStartup";
+
 interface Props {
   onClose: () => void;
 }
@@ -17,6 +23,23 @@ const interactions = [
 ];
 
 export function KeyboardShortcutsHelp({ onClose }: Props) {
+  const [skipOnStartup, setSkipOnStartup] = useState(
+    () =>
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem(SKIP_SHORTCUTS_KEY) === "1",
+  );
+
+  function toggleSkip(next: boolean) {
+    setSkipOnStartup(next);
+    try {
+      if (next) localStorage.setItem(SKIP_SHORTCUTS_KEY, "1");
+      else localStorage.removeItem(SKIP_SHORTCUTS_KEY);
+    } catch {
+      // localStorage unavailable (private mode / disabled) — the dialog
+      // just falls back to showing every startup, which is harmless.
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
       <div
@@ -63,6 +86,16 @@ export function KeyboardShortcutsHelp({ onClose }: Props) {
             ))}
           </tbody>
         </table>
+
+        <label className="mt-4 flex cursor-pointer items-center gap-2 text-xs text-neutral-400">
+          <input
+            type="checkbox"
+            checked={skipOnStartup}
+            onChange={(e) => toggleSkip(e.target.checked)}
+            className="h-3.5 w-3.5 accent-blue-600"
+          />
+          Don&rsquo;t show this automatically on startup
+        </label>
       </div>
     </div>
   );

@@ -17,6 +17,23 @@ interface Props {
    *  the trip-stitched `gpsPoints`) in tiered mode. */
   interpolationTime: number;
   activeSegment: Segment | null;
+  /** Keep the vehicle pinned to the map centre (the map slides under a
+   *  fixed marker) instead of the default leap-frog follow. */
+  centerLock: boolean;
+  /** Adjust zoom from speed: zoom out when fast, in when slow. */
+  autoZoom: boolean;
+  /** Called on a genuine user pan/zoom gesture so the parent can turn
+   *  both assisted-view toggles back off. */
+  onUserInteract: () => void;
+}
+
+/** Map ground speed (m/s) to a Leaflet zoom level: ~17 when stopped,
+ *  stepping out to ~13 around motorway speed. Integer so we only issue a
+ *  zoom change when the level actually flips. */
+function speedToZoom(speedMps: number): number {
+  const kmh = Math.max(0, speedMps) * 3.6;
+  const z = 17 - (kmh / 120) * 4;
+  return Math.round(Math.min(17, Math.max(13, z)));
 }
 
 export function VehicleMarker({
@@ -24,6 +41,9 @@ export function VehicleMarker({
   tripGpsPoints,
   interpolationTime,
   activeSegment,
+  centerLock,
+  autoZoom,
+  onUserInteract,
 }: Props) {
   const map = useMap();
   const loadedTripId = useStore((s) => s.loadedTripId);
@@ -106,18 +126,55 @@ export function VehicleMarker({
     map.setView([interp.lat, interp.lon], 15, { animate: true });
   }, [loadedTripId, isPlaying, interp, map]);
 
+  // Turn the assisted-view toggles off on a genuine user gesture: a
+  // drag (always user) or a wheel / double-click zoom. Programmatic
+  // moves from centre-lock (`setView`) and auto-zoom (`setZoom`) do NOT
+  // fire `dragstart`/`wheel`/`dblclick`, so they don't deactivate
+  // themselves. After deactivation the classic leap-frog follow resumes.
+  useEffect(() => {
+    const container = map.getContainer();
+    const handler = () => onUserInteract();
+    map.on("dragstart", handler);
+    map.on("dblclick", handler);
+    container.addEventListener("wheel", handler, { passive: true });
+    return () => {
+      map.off("dragstart", handler);
+      map.off("dblclick", handler);
+      container.removeEventListener("wheel", handler);
+    };
+  }, [map, onUserInteract]);
+
+  // Centre-lock and/or auto-zoom. When centre-lock is on we recentre on
+  // the vehicle every tick (no animation, so the follow stays smooth);
+  // the target zoom is the auto-zoom value when that's also on, else the
+  // current zoom. When only auto-zoom is on we change zoom but leave
+  // panning to the leap-frog effect below.
+  useEffect(() => {
+    if (!interp || interp.stale) return;
+    if (!centerLock && !autoZoom) return;
+    const targetZoom = autoZoom ? speedToZoom(interp.speedMps) : map.getZoom();
+    if (centerLock) {
+      map.setView([interp.lat, interp.lon], targetZoom, { animate: false });
+    } else if (Math.round(map.getZoom()) !== targetZoom) {
+      map.setZoom(targetZoom, { animate: true });
+    }
+  }, [interp, centerLock, autoZoom, map]);
+
   // Pan-follow whenever the marker leaves the visible area. Pan and
   // zoom are independent — if the user has zoomed out, this just
   // keeps following at their chosen zoom. Skipped while the user is
   // mid-drag or mid-zoom so the auto-pan doesn't fight the gesture;
   // the next interp tick after gesture-end will catch up if needed.
+  // Also skipped under centre-lock, which already keeps the vehicle
+  // centred every tick.
   useEffect(() => {
+    if (centerLock) return;
     if (!interp || interp.stale) return;
     if (userInteractingRef.current) return;
     if (!map.getBounds().contains([interp.lat, interp.lon])) {
       map.panTo([interp.lat, interp.lon], { animate: true, duration: 0.3 });
     }
-  }, [interp, map]);
+  }, [interp, map, centerLock]);
 
   if (!interp) return null;
 

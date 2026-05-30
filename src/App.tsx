@@ -8,7 +8,10 @@ import { HevcSupportGate } from "./components/video/HevcSupportGate";
 import { MainNavTabs } from "./components/MainNavTabs";
 import { PlayerShell } from "./components/video/PlayerShell";
 import { UpdateChecker } from "./components/UpdateChecker";
-import { KeyboardShortcutsHelp } from "./components/KeyboardShortcutsHelp";
+import {
+  KeyboardShortcutsHelp,
+  SKIP_SHORTCUTS_KEY,
+} from "./components/KeyboardShortcutsHelp";
 import { ImportButton } from "./components/import/ImportButton";
 import { ImportConfirmDialog } from "./components/import/ImportConfirmDialog";
 import { ImportProgress } from "./components/import/ImportProgress";
@@ -58,6 +61,14 @@ function App() {
   const [version, setVersion] = useState("");
   const [startup, setStartup] = useState<StartupSnapshot | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+
+  // Show the keyboard-shortcuts overlay on every startup until the user
+  // ticks "Don't show this automatically on startup" in that dialog.
+  useEffect(() => {
+    if (localStorage.getItem(SKIP_SHORTCUTS_KEY) !== "1") {
+      setShowShortcuts(true);
+    }
+  }, []);
 
   useEffect(() => {
     getVersion().then(setVersion);

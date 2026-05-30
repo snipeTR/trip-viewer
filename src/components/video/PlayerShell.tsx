@@ -563,7 +563,17 @@ export function PlayerShell() {
   // Archive-only trips have no MapPanel because GPS lives with the
   // source segments, not the timelapse. Always collapse the map slot.
   const showMap = gpsSupported && !archiveOnly;
-  const gridCols = showMap ? "grid-cols-[2fr_1fr_1fr]" : "grid-cols-[3fr_1fr]";
+  // With exactly two channels, tuck the map under the rear view (column 2)
+  // instead of giving it its own third column — that lets the front view
+  // grow from half-width to two-thirds. Three/four-channel layouts keep
+  // the map as a dedicated column.
+  const channelCount = activeSegmentForVideo?.channels.length ?? 0;
+  const mapUnderSecondary = showMap && channelCount === 2;
+  const gridCols = mapUnderSecondary
+    ? "grid-cols-[2fr_1fr]"
+    : showMap
+      ? "grid-cols-[2fr_1fr_1fr]"
+      : "grid-cols-[3fr_1fr]";
 
   return (
     <div className="flex h-full flex-col">
@@ -571,8 +581,15 @@ export function PlayerShell() {
         <VideoGrid
           channelRefs={channelRefs}
           activeSegment={activeSegmentForVideo}
+          mapSlot={
+            mapUnderSecondary ? (
+              <MapPanel activeSegment={activeSegmentForUi} />
+            ) : undefined
+          }
         />
-        {showMap && <MapPanel activeSegment={activeSegmentForUi} />}
+        {showMap && !mapUnderSecondary && (
+          <MapPanel activeSegment={activeSegmentForUi} />
+        )}
         <DriftHud />
       </div>
       {!gpsSupported && activeSegmentForUi && (

@@ -1,4 +1,9 @@
-import { CSSProperties, MutableRefObject, useEffect } from "react";
+import {
+  CSSProperties,
+  MutableRefObject,
+  ReactNode,
+  useEffect,
+} from "react";
 import type { Segment } from "../../types/model";
 import { ChannelPanel } from "./ChannelPanel";
 import { useStore } from "../../state/store";
@@ -37,6 +42,10 @@ interface Props {
    *  Stable identity across renders so useSyncEngine doesn't re-run. */
   channelRefs: MutableRefObject<Map<string, HTMLVideoElement | null>>;
   activeSegment: Segment | null;
+  /** When provided, the map is rendered inside this grid, in column 2
+   *  directly below the secondary channel(s). PlayerShell passes it only
+   *  for the 2-channel layout so the front view can take more width. */
+  mapSlot?: ReactNode;
 }
 
 /**
@@ -69,7 +78,7 @@ function gridStyle(
   return { gridColumn: 2, gridRow: secondaryIndex + 1 };
 }
 
-export function VideoGrid({ channelRefs, activeSegment }: Props) {
+export function VideoGrid({ channelRefs, activeSegment, mapSlot }: Props) {
   const primaryChannel = useStore((s) => s.primaryChannel);
   const setPrimaryChannel = useStore((s) => s.setPrimaryChannel);
   const videoPort = useStore((s) => s.videoPort);
@@ -134,9 +143,10 @@ export function VideoGrid({ channelRefs, activeSegment }: Props) {
   }
 
   // Row template: if primary takes full height and there are N
-  // secondaries, we need N rows. Minimum of 2 rows for aesthetic
-  // symmetry when there's only 1 secondary.
-  const rowCount = Math.max(secondaries.length, 2);
+  // secondaries, we need N rows. When a map slot is present it claims
+  // one extra row in column 2 (below the secondaries). Minimum of 2
+  // rows for aesthetic symmetry when there's only 1 secondary.
+  const rowCount = Math.max(secondaries.length + (mapSlot ? 1 : 0), 2);
   const gridTemplateRows = `repeat(${rowCount}, minmax(0, 1fr))`;
 
   return (
@@ -166,6 +176,11 @@ export function VideoGrid({ channelRefs, activeSegment }: Props) {
           </div>
         );
       })}
+      {mapSlot && (
+        <div style={{ gridColumn: 2, gridRow: secondaries.length + 1 }}>
+          {mapSlot}
+        </div>
+      )}
     </div>
   );
 }

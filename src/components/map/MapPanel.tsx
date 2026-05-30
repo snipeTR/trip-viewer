@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { MapContainer, TileLayer, useMap } from "react-leaflet";
 import { useStore } from "../../state/store";
 import { interpolateGps } from "../../engine/interpolate";
@@ -176,6 +176,16 @@ export function MapPanel({ activeSegment }: Props) {
   const consumerGpsPoints = isTiered ? tripGpsPoints : segmentGpsPoints;
   const consumerInterpTime = isTiered ? concatTime : currentTime;
 
+  // Assisted-view toggles. Both default off (the classic "leap-frog"
+  // follow). Any genuine pan/zoom gesture flips them back off via
+  // `deactivateAssist` (called from VehicleMarker's gesture listeners).
+  const [centerLock, setCenterLock] = useState(false);
+  const [autoZoom, setAutoZoom] = useState(false);
+  const deactivateAssist = useCallback(() => {
+    setCenterLock(false);
+    setAutoZoom(false);
+  }, []);
+
   const center = useMemo((): [number, number] => {
     if (tripGpsPoints.length > 0) {
       const mid = tripGpsPoints[Math.floor(tripGpsPoints.length / 2)];
@@ -218,9 +228,49 @@ export function MapPanel({ activeSegment }: Props) {
             tripGpsPoints={tripGpsPoints}
             interpolationTime={consumerInterpTime}
             activeSegment={activeSegment}
+            centerLock={centerLock}
+            autoZoom={autoZoom}
+            onUserInteract={deactivateAssist}
           />
         )}
       </MapContainer>
+
+      {hasTripGps && (
+        <div className="pointer-events-auto absolute right-2 top-2 z-[1000] flex flex-col gap-1">
+          <button
+            type="button"
+            onClick={() => setCenterLock((v) => !v)}
+            title="Keep the vehicle locked to the centre of the map. Panning or zooming the map turns this off."
+            className={
+              "flex items-center gap-1.5 rounded-md px-2 py-1 text-xs shadow-lg backdrop-blur " +
+              (centerLock
+                ? "bg-blue-600/90 text-white"
+                : "bg-neutral-900/85 text-neutral-200 hover:bg-neutral-800")
+            }
+          >
+            <span className="inline-block w-3 text-center">
+              {centerLock ? "✓" : ""}
+            </span>
+            Lock centre
+          </button>
+          <button
+            type="button"
+            onClick={() => setAutoZoom((v) => !v)}
+            title="Zoom out as you speed up and in as you slow down. Panning or zooming the map turns this off."
+            className={
+              "flex items-center gap-1.5 rounded-md px-2 py-1 text-xs shadow-lg backdrop-blur " +
+              (autoZoom
+                ? "bg-blue-600/90 text-white"
+                : "bg-neutral-900/85 text-neutral-200 hover:bg-neutral-800")
+            }
+          >
+            <span className="inline-block w-3 text-center">
+              {autoZoom ? "✓" : ""}
+            </span>
+            Auto-zoom
+          </button>
+        </div>
+      )}
 
       {!hasTripGps && (
         <div className="pointer-events-none absolute inset-0 z-[1000] flex items-center justify-center bg-neutral-900/70 text-xs text-neutral-400">
