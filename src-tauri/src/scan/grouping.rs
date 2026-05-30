@@ -83,7 +83,7 @@ fn make_segment(bucket: Vec<GroupingInput>, archive_root: &std::path::Path) -> S
 
     let mut channels: Vec<Channel> = bucket.into_iter().map(make_channel).collect();
     // Canonical order: Front, Interior, Rear, then others alphabetically.
-    channels.sort_by(|a, b| label_rank(&a.label).cmp(&label_rank(&b.label)));
+    channels.sort_by_key(|c| label_rank(&c.label));
 
     // Drop duplicate labels — if two files with the same parser label
     // show up in one bucket, keep the first after canonical sort.
@@ -151,7 +151,7 @@ fn merge_fuzzy_neighbors(segments: Vec<Segment>) -> Vec<Segment> {
             if within_window && same_event_mode && disjoint {
                 let mut combined: Vec<Channel> = last.channels.drain(..).collect();
                 combined.extend(seg.channels);
-                combined.sort_by(|a, b| label_rank(&a.label).cmp(&label_rank(&b.label)));
+                combined.sort_by_key(|c| label_rank(&c.label));
                 last.channels = combined;
                 continue;
             }

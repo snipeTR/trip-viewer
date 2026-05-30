@@ -1037,7 +1037,7 @@ mod tests {
             if std::path::MAIN_SEPARATOR == '/' {
                 rel_path.clone()
             } else {
-                rel_path.replace('/', &std::path::MAIN_SEPARATOR.to_string())
+                rel_path.replace('/', std::path::MAIN_SEPARATOR_STR)
             },
         );
         let old_seg_id = crate::model::derive_segment_id(&old_abs, start_time);
