@@ -95,6 +95,21 @@ pub(crate) fn distribute_files(
             continue;
         }
 
+        // 70mai GPS sidecar log — keep it at the library root so the GPS
+        // decoder (which walks up from each clip's folder) can find it.
+        // It isn't a video/photo, so without this it would be quarantined
+        // to Other/ as an "unknown file" and GPS would silently go missing.
+        if is_gps_sidecar(&filename) {
+            let dest = root_path.join(&filename);
+            // A re-import supersedes any stale copy from a prior run.
+            if dest.exists() {
+                let _ = fs::remove_file(&dest);
+            }
+            move_file(&entry.staged_path, &dest)?;
+            logger.info(&format!("Kept GPS log at library root: {filename}"));
+            continue;
+        }
+
         // Classify by extension
         let dest_dir = match ext.as_str() {
             ".mp4" => Some(&videos_dir),
@@ -299,6 +314,13 @@ pub(crate) fn apply_unknown_decisions(
     }
 
     Ok(count)
+}
+
+/// True if `filename` is a 70mai GPS sidecar log (`GPSData*.txt`). These
+/// are kept at the library root rather than being treated as unknown files.
+fn is_gps_sidecar(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    lower.starts_with("gpsdata") && lower.ends_with(".txt")
 }
 
 /// Extract a date string from a Wolf Box filename like `2026_04_08_163201_00_F.MP4`.

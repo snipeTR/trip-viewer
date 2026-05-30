@@ -152,21 +152,31 @@ fn find_logs(clip_path: &Path) -> Vec<PathBuf> {
     for _ in 0..SIDECAR_SEARCH_DEPTH {
         let Some(d) = dir else { break };
         let mut found: Vec<PathBuf> = Vec::new();
-        if let Ok(entries) = fs::read_dir(d) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let p = entry.path();
-                if p.is_file() && is_gps_log(&p) {
-                    found.push(p);
-                }
-            }
-        }
+        collect_logs_in(d, &mut found);
+        // Also peek into an `Other/` subfolder at this level: libraries
+        // imported before the GPS log was recognized as a sidecar had it
+        // quarantined there as an "unknown file".
+        collect_logs_in(&d.join("Other"), &mut found);
         if !found.is_empty() {
             found.sort();
+            found.dedup();
             return found;
         }
         dir = d.parent();
     }
     Vec::new()
+}
+
+/// Append every `GPSData*.txt` directly inside `dir` to `out`.
+fn collect_logs_in(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.is_file() && is_gps_log(&p) {
+                out.push(p);
+            }
+        }
+    }
 }
 
 /// Read a `GPSData*.txt` and return every well-formed row.
@@ -376,6 +386,24 @@ $V02
 
         let pts = extract(&clip).unwrap();
         // Only the three rows for recording …000000 should match.
+        assert_eq!(pts.len(), 3);
+        assert!(pts.iter().all(|p| p.fix_ok));
+    }
+
+    #[test]
+    fn finds_sidecar_log_quarantined_in_other() {
+        // Older imports moved the unrecognized GPS log into <root>/Other/.
+        // The decoder should still find it when walking up from the clip.
+        let root = tempfile::tempdir().unwrap();
+        let other = root.path().join("Other");
+        fs::create_dir_all(&other).unwrap();
+        write_file(&other, "GPSData000001.txt", SAMPLE);
+        let videos = root.path().join("Videos");
+        fs::create_dir_all(&videos).unwrap();
+        let clip = videos.join("NO20260519-134050-000000F.MP4");
+        fs::File::create(&clip).unwrap();
+
+        let pts = extract(&clip).unwrap();
         assert_eq!(pts.len(), 3);
         assert!(pts.iter().all(|p| p.fix_ok));
     }

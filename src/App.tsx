@@ -57,6 +57,7 @@ function App() {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [version, setVersion] = useState("");
   const [startup, setStartup] = useState<StartupSnapshot | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   useEffect(() => {
     getVersion().then(setVersion);
@@ -235,9 +236,30 @@ function App() {
     <>
     {startup && !startup.done && <StartupSplash snapshot={startup} />}
     <div className="flex h-full">
+      {sidebarCollapsed && (
+        <aside className="flex w-10 shrink-0 flex-col items-center border-r border-neutral-800 py-3">
+          <button
+            onClick={() => setSidebarCollapsed(false)}
+            title="Expand sidebar"
+            className="rounded p-1 text-lg leading-none text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
+          >
+            »
+          </button>
+        </aside>
+      )}
+      {!sidebarCollapsed && (
       <aside className="flex w-72 flex-col border-r border-neutral-800">
         <header className="flex flex-col gap-3 border-b border-neutral-800 p-3">
-          <h1 className="text-sm font-semibold tracking-tight">Trip Viewer</h1>
+          <div className="flex items-center justify-between">
+            <h1 className="text-sm font-semibold tracking-tight">Trip Viewer</h1>
+            <button
+              onClick={() => setSidebarCollapsed(true)}
+              title="Collapse sidebar"
+              className="rounded p-1 text-lg leading-none text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100"
+            >
+              «
+            </button>
+          </div>
           <TripLoader />
           <ImportButton />
           {importError && (
@@ -324,6 +346,7 @@ function App() {
           </div>
         </footer>
       </aside>
+      )}
 
       <main className="flex flex-1 flex-col overflow-hidden">
         <MainNavTabs />

@@ -44,8 +44,20 @@ pub(crate) fn stage_source(
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
+            // Never skip the root the user pointed at.
+            if e.depth() == 0 {
+                return true;
+            }
             if e.file_type().is_dir() {
-                !is_skipped_dir(&e.file_name().to_string_lossy())
+                let name = e.file_name().to_string_lossy();
+                // Skip OS/app dirs AND any dot-prefixed directory. Dashcam
+                // footage never lives in a dot-dir, but some cameras keep
+                // a low-res sub-stream copy beside the main clip in one
+                // (the 70mai `.s_Front` / `.s_Back` proxy folders). Those
+                // share the main clip's filename, so importing them used to
+                // collide and land as `<name>_1.MP4` BAD-NAME files. The
+                // scanner already skips dot-dirs; staging now matches it.
+                !is_skipped_dir(&name) && !name.starts_with('.')
             } else {
                 true
             }
