@@ -57,7 +57,7 @@ Trip Viewer, yaygın dashcam dosya adı formatlarını içe aktarma sırasında 
 - **70mai A810 / RC12** (2 kanal: ön A810 / arka RC12) — `NO20260522-125624-000184F.MP4` gibi; iki harfli ön ek modu (`NO` normal, `EV` olay, `PA` park, `LA` timelapse), sondaki harf kanalı (`F` ön, `B` arka) belirtir. Kart kökündeki `GPSData*.txt` günlüğünden GPS desteği.
 - **Genel 4 kanal** (deneysel) — `2026_03_06_072552_A.MP4` … `_D` gibi.
 
-> Dashcam'iniz farklı bir adlandırma kullanıyorsa [bir issue açın](https://github.com/snipeTR/trip-viewer/issues) ve birkaç örnek dosya adı paylaşın.
+> **Yeni bir kamera formatı eklemek için yapılması gerekenler:** [Yeni bir kamera eklemek](ADDING_A_CAMERA.md) rehberini izleyin — Windows, macOS veya Linux'ta SD kartınızın `dir.txt` + `tree.txt` listesini nasıl oluşturacağınızı ve bu iki dosyayı issue'ya eklemenin neden önemli olduğunu anlatır.
 
 Geliştirme, mimari, sürüm çıkarma ve katkı bilgileri için aşağıdaki İngilizce belgeye bakın.
 
@@ -159,7 +159,7 @@ Currently recognized formats:
 - **70mai A810 / RC12** (2-channel: front A810 / rear RC12) — filenames like `NO20260522-125624-000184F.MP4`, where the two-letter prefix is the recording mode (`NO` normal, `EV` event, `PA` parking, `LA` time-lapse) and the trailing letter is the channel (`F` front, `B` rear). SD cards with the 70mai folder layout (`Normal/`, `Event/`, `Parking/`, `Lapse/`) are auto-detected at import. GPS support via the `GPSData*.txt` sidecar log written at the card root, with speed and heading derived from successive fixes.
 - **Generic 4-channel** (best-effort) — filenames like `2026_03_06_072552_A.MP4` through `..._D.MP4` (or `_1` through `_4`). Labeled "Channel A" through "Channel D". GPS not yet implemented for this format.
 
-If your dashcam uses a different naming convention, [open an issue](https://github.com/chrisl8/trip-viewer/issues) with a few example filenames (and ideally a sample file) and I'll add support. The parser architecture is modular and new format support is a small, low-risk addition.
+If your dashcam uses a different naming convention, it can be added. **To add a new camera format, here's what to do:** follow **[Adding a new camera](ADDING_A_CAMERA.md)** — it walks you through capturing a `dir.txt` + `tree.txt` listing of your SD card on Windows, macOS, or Linux (and explains why attaching both to your issue is what makes the parser addition possible). The parser architecture is modular and new format support is a small, low-risk addition once we can see your card's shape.
 
 ## Built with AI
 
