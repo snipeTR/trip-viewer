@@ -32,7 +32,10 @@ There is **no open-source, multi-channel, GPS-aware dashcam viewer** that uses h
 | SD card import with verify    | no          | no               | no         | no        | **yes**         |
 | Click-to-swap channels        | no          | no               | no         | no        | **yes**         |
 | Pre-rendered timelapses       | no          | no               | no         | no        | **yes**         |
+| Recording-mode filter         | no          | no               | no         | no        | **yes**         |
 | Open source                   | no          | no               | no         | no        | **yes**         |
+
+**Cameras Trip Viewer auto-detects today:** Wolf Box (3-channel), Thinkware (2-channel), Miltona MNCD60 (single-channel), **70mai A810 / RC12 (2-channel)**, and a generic 4-channel fallback. The parser layer in `scan/naming.rs` is modular — see [`ADDING_A_CAMERA.md`](ADDING_A_CAMERA.md) for adding more.
 
 ---
 
@@ -42,7 +45,7 @@ There is **no open-source, multi-channel, GPS-aware dashcam viewer** that uses h
 
 - **Tauri v2** — Rust backend, web frontend, ~3 MB installer. Uses the system WebView2 runtime (pre-installed on Windows 10/11) on Windows and WebKitGTK 4.1 on Linux, instead of bundling Chromium.
 - **React 19 + TypeScript** — frontend with Zustand for state, Tailwind CSS v4 for styling.
-- **N HTML5 `<video>` elements** — one per channel, synchronized via `requestVideoFrameCallback` against a stable master ref (front when present, otherwise the first channel). The grid adapts to the dashcam's channel count (1 for Miltona, 2 for Thinkware, 3 for Wolf Box, up to 4 for the generic format). Hardware-accelerated decoding via the browser's native HEVC decoder.
+- **N HTML5 `<video>` elements** — one per channel, synchronized via `requestVideoFrameCallback` against a stable master ref (front when present, otherwise the first channel). The grid adapts to the dashcam's channel count (1 for Miltona, 2 for Thinkware and 70mai, 3 for Wolf Box, up to 4 for the generic format); two-channel segments tuck the map under the rear view so the front grows to 2/3 width. Hardware-accelerated decoding via the browser's native HEVC decoder.
 - **Leaflet + OpenStreetMap** — live GPS map with track polyline and interpolated vehicle marker. Auto-pans to follow the vehicle, but holds during user drag/zoom gestures. Opt-in **Lock-centre** and **Auto-zoom** toggles (any manual gesture disables them); void fixes are filtered and brief (≤2s) dropouts are bridged by dead-reckoning along the last heading/speed.
 - **Pure Rust container parsing** — `mp4` crate for metadata, custom binary parser for ShenShu GPS format. No ffprobe dependency.
 - **Optional ffmpeg for timelapse** — the timelapse feature shells out to a user-supplied ffmpeg binary (configured in-app, not bundled) to pre-render fast-playback MP4s with GPS-driven variable speed. NVENC/NVDEC is used when available. Distinct from the rejected "ffprobe for metadata" decision below — playback and import remain ffmpeg-free; timelapse is opt-in.
@@ -97,26 +100,32 @@ On Windows the app renders front, interior, and rear simultaneously by default. 
 ```
 Trip
 ├── id: uuid
-├── startTime: datetime
+├── startTime / endTime: datetime
+├── cameraKind: WolfBox | Thinkware | Miltona | SeventyMai | Generic
+├── gpsSupported: bool
 ├── segments: Segment[]
 
 Segment
 ├── id: uuid
 ├── startTime: datetime
 ├── durationS: f64
+├── isEvent: bool          # derived from EventMode (Normal/Event/Parked/Lapse/Other)
+├── cameraKind / gpsSupported
 ├── channels: Channel[]
-│   ├── kind: "front" | "interior" | "rear"
+│   ├── label: string      # free-form: "Front" | "Interior" | "Rear" | "Channel A".. etc.
 │   ├── filePath: string
-│   ├── resolution: { width, height }
+│   ├── width / height: u32
 │   ├── fps: f64
 │   └── codec: string
 
 GpsPoint
-├── timestampS: f64
+├── tOffsetS: f64          # seconds from track start
 ├── lat: f64
 ├── lon: f64
-├── speedKmh: f64
-├── heading: f64
+├── speedMps: f64
+├── headingDeg: f64
+├── altitudeM: f64
+├── fixOk: bool            # false = void fix (filtered from the map; bridged by dead-reckoning)
 ```
 
 File detection is multi-format (`scan/naming.rs`). Each parser maps a filename to a start time, `CameraKind`, channel label, and `EventMode` (Normal / Event / Parked / Lapse / Other). Examples: Wolf Box `YYYY_MM_DD_HHMMSS_EE_C.MP4`, 70mai `NO/EV/PA/LA{YYYYMMDD}-{HHMMSS}-{serial}{F|B}.MP4`. Files are grouped into segments by fuzzy timestamp matching (3-second window), then merged into trips by time gaps (120-second threshold). The recording mode is surfaced in the sidebar as a trip-list filter (derived client-side from the filename, no DB column).
