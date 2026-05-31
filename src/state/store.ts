@@ -45,6 +45,7 @@ import {
   getLibraryStorageSummary as ipcGetLibraryStorageSummary,
   type LibraryStorageSummary,
 } from "../ipc/library";
+import { loadTripGps as ipcLoadTripGps } from "../ipc/gps";
 import type { CurveSegment } from "../utils/speedCurve";
 
 export type AppStatus = "idle" | "loading" | "ready" | "error";
@@ -218,6 +219,11 @@ export interface AppState
    *  bytes on disk. Errors are swallowed — a stale total is better
    *  than a crashed sidebar. */
   refreshLibrarySummary: () => Promise<void>;
+  /** Re-fetch a trip's persisted (trip-stitched) GPS into
+   *  `tripGpsByTrip`. Called after a rebuild so the map + speed graph
+   *  populate without the user having to close and reopen the trip
+   *  (the encoder persists fresh GPS during the rebuild). */
+  refreshTripGps: (tripId: string) => Promise<void>;
   /** Toggle the reclaimable-only filter in the sidebar trip list. */
   setReclaimableFilter: (enabled: boolean) => void;
 
@@ -924,6 +930,19 @@ export const useStore = create<AppState>((set) => ({
       void useStore.getState().refreshOrphanCount();
     } catch (e) {
       console.error("refreshTimelapseJobs failed", e);
+    }
+  },
+  refreshTripGps: async (tripId) => {
+    try {
+      const archived = await ipcLoadTripGps(tripId);
+      // Set unconditionally (even when empty) so a rebuild that produced
+      // GPS replaces a stale/empty entry, and a trip with genuinely no
+      // GPS falls back correctly to the per-file pool.
+      set((s) => ({
+        tripGpsByTrip: { ...s.tripGpsByTrip, [tripId]: archived },
+      }));
+    } catch (e) {
+      console.error("refreshTripGps failed", e);
     }
   },
   refreshOrphanCount: async () => {

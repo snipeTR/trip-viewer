@@ -232,6 +232,14 @@ function App() {
         // Jobs list may have new rows — refresh so the trip table
         // reflects the latest statuses.
         void useStore.getState().refreshTimelapseJobs();
+        // The rebuild also persisted fresh trip-stitched GPS. Re-load it
+        // for the trip currently open so the map + speed graph populate
+        // immediately, instead of staying empty until the user closes
+        // and reopens the trip.
+        const { loadedTripId } = useStore.getState();
+        if (loadedTripId) {
+          void useStore.getState().refreshTripGps(loadedTripId);
+        }
       }),
     );
     return () => {
