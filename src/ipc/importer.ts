@@ -9,6 +9,7 @@ import type {
   UnknownFileDecision,
   WipeError,
   WipeErrorAction,
+  WipeConfirmRequest,
   ImportResult,
 } from "../types/import";
 
@@ -78,6 +79,16 @@ export function onImportWipeError(
   cb: (e: WipeError) => void,
 ): Promise<UnlistenFn> {
   return listen<WipeError>("import:wipeError", (e) => cb(e.payload));
+}
+
+export function resolveWipeConfirm(wipe: boolean): Promise<void> {
+  return invoke("resolve_wipe_confirm", { wipe });
+}
+
+export function onImportConfirmWipe(
+  cb: (e: WipeConfirmRequest) => void,
+): Promise<UnlistenFn> {
+  return listen<WipeConfirmRequest>("import:confirmWipe", (e) => cb(e.payload));
 }
 
 export function onImportComplete(

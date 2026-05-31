@@ -9,6 +9,31 @@ export interface InterpolatedGps {
   stale: boolean;
 }
 
+/** Dead-reckon through GPS dropouts up to this many seconds: project the
+ *  last known position forward along its heading at its last speed so a
+ *  brief signal loss doesn't visibly freeze or break the track. Beyond
+ *  this the position is held and flagged stale. */
+const GAP_PREDICT_S = 2;
+
+const EARTH_RADIUS_M = 6_371_000;
+
+/** Advance a fix `dtS` seconds forward along its own heading at its own
+ *  speed (equirectangular approximation — fine for the few metres a 1–2s
+ *  prediction covers). A stationary fix (speed ≈ 0) stays put. */
+function deadReckon(p: GpsPoint, dtS: number): { lat: number; lon: number } {
+  const dist = Math.max(0, p.speedMps) * dtS;
+  if (dist === 0) return { lat: p.lat, lon: p.lon };
+  const hr = (p.headingDeg * Math.PI) / 180;
+  const dLat = (dist * Math.cos(hr)) / EARTH_RADIUS_M;
+  const dLon =
+    (dist * Math.sin(hr)) /
+    (EARTH_RADIUS_M * Math.cos((p.lat * Math.PI) / 180));
+  return {
+    lat: p.lat + (dLat * 180) / Math.PI,
+    lon: p.lon + (dLon * 180) / Math.PI,
+  };
+}
+
 export function interpolateGps(
   points: GpsPoint[],
   tOffsetS: number,
@@ -29,13 +54,17 @@ export function interpolateGps(
 
   const last = points[points.length - 1];
   if (tOffsetS >= last.tOffsetS) {
+    const dt = tOffsetS - last.tOffsetS;
+    // Within the prediction window, keep moving along the last heading;
+    // past it, hold position and mark stale.
+    const proj = dt <= GAP_PREDICT_S ? deadReckon(last, dt) : last;
     return {
-      lat: last.lat,
-      lon: last.lon,
+      lat: proj.lat,
+      lon: proj.lon,
       speedMps: last.speedMps,
       headingDeg: last.headingDeg,
       altitudeM: last.altitudeM,
-      stale: tOffsetS > last.tOffsetS + 2,
+      stale: dt > GAP_PREDICT_S,
     };
   }
 
@@ -52,15 +81,19 @@ export function interpolateGps(
   const b = points[hi];
   const gap = b.tOffsetS - a.tOffsetS;
 
-  // Freeze on GPS gaps > 2s
-  if (gap > 2) {
+  // Long gap between fixes: dead-reckon forward from the earlier fix for
+  // the first couple of seconds so a brief dropout looks continuous, then
+  // hold and flag stale until the next real fix.
+  if (gap > GAP_PREDICT_S) {
+    const dt = tOffsetS - a.tOffsetS;
+    const proj = dt <= GAP_PREDICT_S ? deadReckon(a, dt) : a;
     return {
-      lat: a.lat,
-      lon: a.lon,
+      lat: proj.lat,
+      lon: proj.lon,
       speedMps: a.speedMps,
       headingDeg: a.headingDeg,
       altitudeM: a.altitudeM,
-      stale: true,
+      stale: dt > GAP_PREDICT_S,
     };
   }
 

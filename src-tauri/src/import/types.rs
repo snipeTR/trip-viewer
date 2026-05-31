@@ -115,6 +115,16 @@ pub enum WipeErrorAction {
     Cancel,
 }
 
+/// Copy report shown to the user after staging, alongside the "wipe the
+/// SD card now?" question. The answer comes back via `resolve_wipe_confirm`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WipeConfirmRequest {
+    pub source_label: String,
+    pub files_staged: u32,
+    pub bytes_staged: u64,
+}
+
 // ── Import Result ──
 
 #[derive(Debug, Clone, Serialize)]

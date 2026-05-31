@@ -8,6 +8,7 @@ import type {
   ImportWarning,
   UnknownFile,
   WipeError,
+  WipeConfirmRequest,
   ImportResult,
 } from "../types/import";
 import type { TagsSlice } from "./tagsSlice";
@@ -122,6 +123,7 @@ export type ImportStatus =
   | "running"
   | "paused_unknowns"
   | "paused_wipe_error"
+  | "paused_wipe_confirm"
   | "complete"
   | "error";
 
@@ -133,6 +135,7 @@ export interface ImportSlice {
   importWarnings: ImportWarning[];
   importUnknowns: UnknownFile[];
   importWipeError: WipeError | null;
+  importWipeConfirm: WipeConfirmRequest | null;
   importResult: ImportResult | null;
   importError: string | null;
   importRootPath: string | null;
@@ -144,6 +147,7 @@ export interface ImportSlice {
   addImportWarning: (w: ImportWarning) => void;
   setImportUnknowns: (files: UnknownFile[]) => void;
   setImportWipeError: (e: WipeError | null) => void;
+  setImportWipeConfirm: (e: WipeConfirmRequest | null) => void;
   setImportResult: (result: ImportResult | null) => void;
   setImportError: (e: string | null) => void;
   setImportRootPath: (path: string | null) => void;
@@ -312,6 +316,7 @@ export const useStore = create<AppState>((set) => ({
   importWarnings: [],
   importUnknowns: [],
   importWipeError: null,
+  importWipeConfirm: null,
   importResult: null,
   importError: null,
   importRootPath: null,
@@ -364,6 +369,11 @@ export const useStore = create<AppState>((set) => ({
       // resolver already set back to "running".
       importStatus: importWipeError ? "paused_wipe_error" : s.importStatus,
     })),
+  setImportWipeConfirm: (importWipeConfirm) =>
+    set((s) => ({
+      importWipeConfirm,
+      importStatus: importWipeConfirm ? "paused_wipe_confirm" : s.importStatus,
+    })),
   setImportResult: (importResult) =>
     set({ importResult, importStatus: importResult ? "complete" : "idle" }),
   setImportError: (importError) =>
@@ -378,6 +388,7 @@ export const useStore = create<AppState>((set) => ({
       importWarnings: [],
       importUnknowns: [],
       importWipeError: null,
+      importWipeConfirm: null,
       importResult: null,
       importError: null,
       importRootPath: null,

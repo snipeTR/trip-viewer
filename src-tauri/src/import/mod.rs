@@ -31,6 +31,9 @@ pub struct ImportState {
     unknown_receiver: Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
     wipe_error_sender: Arc<Mutex<Option<mpsc::Sender<WipeErrorAction>>>>,
     wipe_error_receiver: Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
+    /// Carries the user's yes/no answer to "wipe the SD card now?".
+    wipe_confirm_sender: Arc<Mutex<Option<mpsc::Sender<bool>>>>,
+    wipe_confirm_receiver: Arc<Mutex<Option<mpsc::Receiver<bool>>>>,
 }
 
 impl ImportState {
@@ -42,6 +45,8 @@ impl ImportState {
             unknown_receiver: Arc::new(Mutex::new(None)),
             wipe_error_sender: Arc::new(Mutex::new(None)),
             wipe_error_receiver: Arc::new(Mutex::new(None)),
+            wipe_confirm_sender: Arc::new(Mutex::new(None)),
+            wipe_confirm_receiver: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -92,10 +97,16 @@ pub async fn start_import(
     *state.wipe_error_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wtx);
     *state.wipe_error_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wrx);
 
+    // Set up channel for the "wipe the SD card now?" confirmation.
+    let (ctx, crx) = mpsc::channel::<bool>();
+    *state.wipe_confirm_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(ctx);
+    *state.wipe_confirm_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(crx);
+
     let cancel_flag = state.cancel_flag.clone();
     let running = state.running.clone();
     let unknown_receiver = state.unknown_receiver.clone();
     let wipe_error_receiver = state.wipe_error_receiver.clone();
+    let wipe_confirm_receiver = state.wipe_confirm_receiver.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         // SD-card import is destructive on success: wipe_eligible=true.
@@ -104,6 +115,7 @@ pub async fn start_import(
             &cancel_flag,
             &unknown_receiver,
             &wipe_error_receiver,
+            &wipe_confirm_receiver,
             &root_path,
             &sources,
             true,
@@ -165,11 +177,14 @@ pub async fn start_folder_import(
     *state.unknown_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(tx);
     *state.unknown_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(rx);
 
-    // Folder import never wipes, but set up the channel anyway so the
-    // pipeline signature is uniform; the receiver simply goes unused.
+    // Folder import never wipes, but set up the channels anyway so the
+    // pipeline signature is uniform; the receivers simply go unused.
     let (wtx, wrx) = mpsc::channel::<WipeErrorAction>();
     *state.wipe_error_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wtx);
     *state.wipe_error_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(wrx);
+    let (ctx, crx) = mpsc::channel::<bool>();
+    *state.wipe_confirm_sender.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(ctx);
+    *state.wipe_confirm_receiver.lock().map_err(|e| AppError::Internal(e.to_string()))? = Some(crx);
 
     // Synthesize an ImportSource. file_count/total_bytes are populated
     // by the stage phase's own walk; we leave them zero here (the
@@ -193,6 +208,7 @@ pub async fn start_folder_import(
     let running = state.running.clone();
     let unknown_receiver = state.unknown_receiver.clone();
     let wipe_error_receiver = state.wipe_error_receiver.clone();
+    let wipe_confirm_receiver = state.wipe_confirm_receiver.clone();
     let sources = vec![synthetic];
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -202,6 +218,7 @@ pub async fn start_folder_import(
             &cancel_flag,
             &unknown_receiver,
             &wipe_error_receiver,
+            &wipe_confirm_receiver,
             &root_path,
             &sources,
             false,
@@ -310,6 +327,28 @@ pub async fn resolve_wipe_error(
     }
 }
 
+/// Answer the "wipe the SD card now?" prompt. `wipe=false` leaves the
+/// card untouched; the staged copies are still distributed to the library.
+#[tauri::command]
+pub async fn resolve_wipe_confirm(
+    state: tauri::State<'_, ImportState>,
+    wipe: bool,
+) -> Result<(), AppError> {
+    let sender = state
+        .wipe_confirm_sender
+        .lock()
+        .map_err(|e| AppError::Internal(format!("lock error: {e}")))?;
+
+    match sender.as_ref() {
+        Some(tx) => {
+            tx.send(wipe)
+                .map_err(|e| AppError::Internal(format!("channel send error: {e}")))?;
+            Ok(())
+        }
+        None => Err(AppError::NoImportRunning),
+    }
+}
+
 // ── Pipeline orchestration ──
 
 /// Run the full import pipeline against one or more sources.
@@ -320,11 +359,13 @@ pub async fn resolve_wipe_error(
 /// passes `false` (the user keeps the original folder; we never touch
 /// it). The wipe is *additionally* gated on `all_verified`, the cancel
 /// flag, and `source.read_only`, regardless of `wipe_eligible`.
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline(
     app: &tauri::AppHandle,
     cancel_flag: &AtomicBool,
     unknown_receiver: &Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
     wipe_error_receiver: &Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
+    wipe_confirm_receiver: &Arc<Mutex<Option<mpsc::Receiver<bool>>>>,
     root_path: &str,
     sources: &[ImportSource],
     wipe_eligible: bool,
@@ -397,6 +438,7 @@ fn run_pipeline(
             cancel_flag,
             unknown_receiver,
             wipe_error_receiver,
+            wipe_confirm_receiver,
             app,
             &mut logger,
             wipe_eligible,
@@ -427,6 +469,7 @@ fn process_source(
     cancel_flag: &AtomicBool,
     unknown_receiver: &Arc<Mutex<Option<mpsc::Receiver<Vec<UnknownFileDecision>>>>>,
     wipe_error_receiver: &Arc<Mutex<Option<mpsc::Receiver<WipeErrorAction>>>>,
+    wipe_confirm_receiver: &Arc<Mutex<Option<mpsc::Receiver<bool>>>>,
     app: &tauri::AppHandle,
     logger: &mut ImportLogger,
     wipe_eligible: bool,
@@ -473,12 +516,27 @@ fn process_source(
         && !cancel_flag.load(Ordering::Relaxed)
         && !source.read_only
     {
-        match wipe::wipe_source(source, cancel_flag, wipe_error_receiver, app, logger) {
-            Ok(()) => result.source_wiped = true,
-            Err(e) => {
-                logger.warn(&format!("Wipe failed: {e}"));
-                result.warnings.push(format!("Wipe failed: {e}"));
+        // Show the copy report and ask before erasing. If the user
+        // declines (or the prompt is dismissed), the card is left
+        // untouched — the staged copies are still distributed below.
+        let confirmed = prompt_wipe_confirm(
+            app,
+            wipe_confirm_receiver,
+            source,
+            result.files_staged,
+            result.bytes_staged,
+            logger,
+        );
+        if confirmed {
+            match wipe::wipe_source(source, cancel_flag, wipe_error_receiver, app, logger) {
+                Ok(()) => result.source_wiped = true,
+                Err(e) => {
+                    logger.warn(&format!("Wipe failed: {e}"));
+                    result.warnings.push(format!("Wipe failed: {e}"));
+                }
             }
+        } else {
+            logger.info("User chose to keep files on the SD card; skipping wipe.");
         }
     } else if wipe_eligible && source.read_only {
         logger.info("Skipping wipe: source is read-only");
@@ -522,6 +580,36 @@ fn process_source(
     }
 
     result
+}
+
+/// Show the copy report and ask the user whether to wipe the SD card.
+/// Blocks until `resolve_wipe_confirm` answers. Returns `false` (keep the
+/// card) if the channel is unavailable or closed — never wipe on a
+/// dismissed/torn-down prompt.
+fn prompt_wipe_confirm(
+    app: &tauri::AppHandle,
+    receiver: &Arc<Mutex<Option<mpsc::Receiver<bool>>>>,
+    source: &ImportSource,
+    files_staged: u32,
+    bytes_staged: u64,
+    logger: &mut ImportLogger,
+) -> bool {
+    logger.info(&format!(
+        "Copy complete for {}: {} file(s), {} bytes. Awaiting wipe decision.",
+        source.label, files_staged, bytes_staged
+    ));
+    let _ = app.emit("import:confirmWipe", types::WipeConfirmRequest {
+        source_label: source.label.clone(),
+        files_staged,
+        bytes_staged,
+    });
+
+    let rx_guard = receiver.lock().ok();
+    rx_guard
+        .as_ref()
+        .and_then(|opt| opt.as_ref())
+        .and_then(|rx| rx.recv().ok())
+        .unwrap_or(false)
 }
 
 /// Emit unknowns to frontend and block until decisions arrive via channel.

@@ -43,6 +43,12 @@ export interface WipeError {
 
 export type WipeErrorAction = "retry" | "skip" | "cancel";
 
+export interface WipeConfirmRequest {
+  sourceLabel: string;
+  filesStaged: number;
+  bytesStaged: number;
+}
+
 export interface UnknownFile {
   stagedPath: string;
   relPath: string;

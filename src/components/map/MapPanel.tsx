@@ -176,6 +176,19 @@ export function MapPanel({ activeSegment }: Props) {
   const consumerGpsPoints = isTiered ? tripGpsPoints : segmentGpsPoints;
   const consumerInterpTime = isTiered ? concatTime : currentTime;
 
+  // Drop void fixes (no satellite lock — their lat/lon is 0,0). Feeding
+  // them to the track or marker would yank the line/marker to "null
+  // island". Interpolation then bridges the resulting time gaps (and
+  // dead-reckons short ones), so a brief signal loss stays invisible.
+  const validTripGpsPoints = useMemo(
+    () => tripGpsPoints.filter((p) => p.fixOk),
+    [tripGpsPoints],
+  );
+  const validConsumerGpsPoints = useMemo(
+    () => consumerGpsPoints.filter((p) => p.fixOk),
+    [consumerGpsPoints],
+  );
+
   // Assisted-view toggles. Both default off (the classic "leap-frog"
   // follow). Any genuine pan/zoom gesture flips them back off via
   // `deactivateAssist` (called from VehicleMarker's gesture listeners).
@@ -187,12 +200,13 @@ export function MapPanel({ activeSegment }: Props) {
   }, []);
 
   const center = useMemo((): [number, number] => {
-    if (tripGpsPoints.length > 0) {
-      const mid = tripGpsPoints[Math.floor(tripGpsPoints.length / 2)];
+    if (validTripGpsPoints.length > 0) {
+      const mid =
+        validTripGpsPoints[Math.floor(validTripGpsPoints.length / 2)];
       return [mid.lat, mid.lon];
     }
     return [37.69, -97.34];
-  }, [tripGpsPoints]);
+  }, [validTripGpsPoints]);
 
   // If the camera model doesn't record GPS at all, don't render anything —
   // PlayerShell collapses the grid slot and shows a small inline caption
@@ -208,7 +222,7 @@ export function MapPanel({ activeSegment }: Props) {
   // pane attachment — symptom: tiles render but track + marker
   // silently fail to paint until you click away and back). The
   // "No GPS data" caption renders on top instead of replacing it.
-  const hasTripGps = tripGpsPoints.length > 0;
+  const hasTripGps = validTripGpsPoints.length > 0;
 
   return (
     <div className="relative h-full w-full overflow-hidden rounded-md">
@@ -221,11 +235,11 @@ export function MapPanel({ activeSegment }: Props) {
       >
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
         <MapResizeObserver />
-        {hasTripGps && <TrackPolyline points={tripGpsPoints} />}
+        {hasTripGps && <TrackPolyline points={validTripGpsPoints} />}
         {hasTripGps && (
           <VehicleMarker
-            gpsPoints={consumerGpsPoints}
-            tripGpsPoints={tripGpsPoints}
+            gpsPoints={validConsumerGpsPoints}
+            tripGpsPoints={validTripGpsPoints}
             interpolationTime={consumerInterpTime}
             activeSegment={activeSegment}
             centerLock={centerLock}
@@ -279,7 +293,7 @@ export function MapPanel({ activeSegment }: Props) {
       )}
 
       <GpsMissingRibbon
-        gpsPoints={consumerGpsPoints}
+        gpsPoints={validConsumerGpsPoints}
         interpolationTime={consumerInterpTime}
         activeSegment={activeSegment}
       />
@@ -288,12 +302,12 @@ export function MapPanel({ activeSegment }: Props) {
 
       <div className="pointer-events-none absolute bottom-3 right-3 z-[1000] flex gap-2">
         <SpeedReadout
-          gpsPoints={consumerGpsPoints}
+          gpsPoints={validConsumerGpsPoints}
           interpolationTime={consumerInterpTime}
           activeSegment={activeSegment}
         />
         <HeadingReadout
-          gpsPoints={consumerGpsPoints}
+          gpsPoints={validConsumerGpsPoints}
           interpolationTime={consumerInterpTime}
           activeSegment={activeSegment}
         />

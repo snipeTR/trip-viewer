@@ -268,6 +268,7 @@ pub fn run() {
             import::cancel_import,
             import::resolve_unknowns,
             import::resolve_wipe_error,
+            import::resolve_wipe_confirm,
             issues::issues_delete_to_trash,
             tags::commands::get_tags_for_trip,
             tags::commands::get_tag_counts_by_trip,
