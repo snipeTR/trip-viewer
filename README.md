@@ -1,3 +1,68 @@
+**🇹🇷 Türkçe** &nbsp;·&nbsp; [🇬🇧 English](#trip-viewer)
+
+# Trip Viewer (Türkçe)
+
+**Senkronize video ve canlı GPS haritası sunan, ücretsiz ve açık kaynaklı bir dashcam (araç kamerası) görüntüleyici.**
+
+Trip Viewer, bir ila dört kameralı dashcam kayıtlarını her kanalı tam senkron tutarak oynatır. Video oynarken canlı bir OpenStreetMap görünümü aracınızın GPS konumunu, hız ve yön bilgisiyle birlikte haritada takip eder — tek kameralı dashcam sahipleri kadar çok kanallı kurulumlar için de sevilen bir özellik.
+
+Donanımsal video çözme, yüksek çözünürlükte bile akıcı oynatma sağlar. Trip Viewer; Windows, macOS ve Linux'ta hafif, yerel bir uygulama olarak çalışır (Windows'ta ~3 MB kurulum dosyası, macOS'ta imzalı DMG, Linux'ta AppImage).
+
+## Kurulum
+
+**Windows 10/11, macOS 11 (Big Sur) ve üzeri, ve güncel Linux dağıtımlarında (Ubuntu 22.04+ test edildi) çalışır.** Geliştirici aracı gerekmez.
+
+### Windows
+1. [Releases sayfasına](https://github.com/snipeTR/trip-viewer/releases) gidin.
+2. En son sürümün altından **`_x64-setup.exe`** ile biten dosyayı indirin.
+3. Kurulumu çalıştırın — uygulama yeni ve imzasız olduğu için Windows bir SmartScreen uyarısı gösterebilir. **"Ek bilgi" → "Yine de çalıştır"** deyin.
+4. **Trip Viewer**'ı Başlat menüsünden açın.
+
+**Windows'ta tek ek gereksinim:** Dashcam'iniz büyük olasılıkla HEVC (H.265) formatında kaydeder ve Windows bunun için bir çözücüye ihtiyaç duyar. Trip Viewer açılışta kontrol eder ve eksikse sizi Microsoft Store'a yönlendirir. [HEVC Video Uzantısı](https://apps.microsoft.com/detail/9n4wgh0z6vhq) tek seferlik bir kurulumdur.
+
+### Linux
+1. [Releases sayfasından](https://github.com/snipeTR/trip-viewer/releases) **`.AppImage`** ile biten dosyayı indirin.
+2. Çalıştırılabilir yapın: `chmod +x trip-viewer_*_amd64.AppImage`
+3. Çalıştırın: `./trip-viewer_*_amd64.AppImage`
+
+HEVC oynatma için GStreamer'ın libav eklentisi gerekir; eksikse uygulama açılışta bir kurulum ipucu gösterir. Debian/Ubuntu'da: `sudo apt install gstreamer1.0-libav gstreamer1.0-plugins-bad`
+
+## Neler yapar
+
+Uygulama üstte bir sekme çubuğu — **Player**, **Scan**, **Review**, **Timelapse**, (gerektiğinde) **Issues** ve **Places** — ve solda her zaman görünen bir trip listesi + depolama özeti şeklinde düzenlenmiştir. Sol panel, video panellerini olabildiğince büyütmek istediğinizde başlığındaki **«** simgesiyle ince bir şeride katlanır.
+
+- **Çok kanallı senkron oynatma (1–4 kanal)** — dashcam'inizdeki her kamera tam uyumla oynar. Yan görüntüye tıklayarak ana görünüm yapın; ana görünüme çift tıklayarak tam ekrana geçin.
+- **Canlı GPS haritası** — OpenStreetMap görünümü aracınızı gerçek zamanlı izler ve geçtiğiniz yolu çizer. Varsayılan olarak harita aracı takip eder ama siz sürükleyip yakınlaştırırken yerinde kalır. Haritanın köşesindeki iki tik daha ileri gider: **Lock centre** aracı haritanın merkezine kilitler (harita aracın altında kayar), **Auto-zoom** hızlandıkça uzaklaşır, yavaşladıkça yakınlaşır. Haritayı elle hareket ettirdiğinizde/yakınlaştırdığınızda ikisi de kapanır. Kısa GPS kesintileri (~2 sn'ye kadar) son yön ve hıza göre tahminle köprülenir; böylece kısa sinyal kayıplarında iz donmaz/kopmaz.
+- **İki kanal düzeni** — ön+arka dashcam'lerde harita arka görüntünün altına yerleşir ve ön kamera genişliğin üçte ikisini kaplar; üç/dört kanallı düzenlerde harita kendi sütununda durur.
+- **Hız ve yön göstergesi** — harita üzerinde gerçek zamanlı okumalar.
+- **Hız grafikli zaman çizelgesi** — görüntü içinde görsel olarak gezinin; sert frenleme/hızlanma gibi ilginç anlar grafikte belirir.
+- **Timelapse hattı** — _(sisteminizde ffmpeg gerektirir.)_ Her trip'in 8× / 16× / 60× hızlı oynatma sürümlerini önceden render eder; olaylarda yavaşlar. NVENC/NVDEC donanım hızlandırma varsa otomatik kullanılır.
+- **SD kart içe aktarma** — kayıtları doğrudan dashcam SD kartından alır. Dosyalar SHA-256 bütünlük doğrulamasıyla kopyalanır; ardından bir rapor ne aktarıldığını gösterir ve **SD kartı silmek mi yoksa dosyaları kartta tutmak mı** istediğinizi sorar — "tut" derseniz karta hiç dokunulmaz (kopyalar zaten kütüphanenizde güvende). Güvenlik korumaları, kartın kendi hedefi olarak kullanılmasını engeller; silme sırasında bir dosya silinemezse uygulama durup **Retry / Skip / Cancel wipe** sorar.
+- **Klasörden içe aktarma** — diskte zaten var olan dosyalar için silme yapmayan sürüm.
+- **Trip algılama** — kayıtları zaman damgalarına göre otomatik olarak trip'lere gruplar.
+- **Kayıt modu filtresi** — dashcam birden fazla modda kaydediyorsa (örn. 70mai'nin Normal / Event / Parking / Time-lapse'i) sol listenin üstünde bir filtre çubuğu çıkar; bir moda tıklayınca yalnızca o modun kayıtları görünür.
+- **Orijinaller ve timelapse'ler** — bir trip'in orijinallerini silseniz de timelapse'leri kalır ve trip kütüphanede oynamaya devam eder.
+- **Otomatik etiketleme taraması, Yerler (Places), İnceleme (Review), Sorunlar (Issues)** — kütüphaneyi tarayıp olay/durağan/sessiz segmentleri ve kayıtlı yer eşleşmelerini etiketler; toplu inceleme/silme araçları sunar.
+- **Silinenler geri dönüşüm kutusuna gider** — uygulamanın sildiği her şey sistem çöp kutusuna gider.
+- **Klavye kısayolları** — Boşluk oynat/duraklat, ok tuşları sarma, köşeli parantezler hız. Kısayol listesi, "Don't show this automatically on startup" kutusunu işaretleyene kadar her açılışta otomatik açılır; sol alttaki "Keyboard shortcuts" ile her zaman tekrar açılabilir.
+- **Otomatik güncelleme** — uygulama açılışta yeni sürümü kontrol eder ve tek tıkla günceller.
+
+## Desteklenen dashcam'ler
+
+Trip Viewer, yaygın dashcam dosya adı formatlarını içe aktarma sırasında otomatik tanır — yeniden adlandırma veya ayar gerekmez.
+
+- **Wolf Box** (3 kanal: ön / iç / arka) — `2026_03_15_173951_02_F.MP4` gibi. ShenShu metadata çözücüsüyle tam GPS desteği.
+- **Thinkware** (2 kanal: ön / arka) — `REC_..._F.MP4` / `EVT_...` gibi. Test edilen model GPS kaydetmiyor; harita gizlenir.
+- **Miltona MNCD60** (tek kanal) — `FILE211202-151504-000406F.MOV` gibi. NovaTek `gps0` atomundan GPS desteği.
+- **70mai A810 / RC12** (2 kanal: ön A810 / arka RC12) — `NO20260522-125624-000184F.MP4` gibi; iki harfli ön ek modu (`NO` normal, `EV` olay, `PA` park, `LA` timelapse), sondaki harf kanalı (`F` ön, `B` arka) belirtir. Kart kökündeki `GPSData*.txt` günlüğünden GPS desteği.
+- **Genel 4 kanal** (deneysel) — `2026_03_06_072552_A.MP4` … `_D` gibi.
+
+> Dashcam'iniz farklı bir adlandırma kullanıyorsa [bir issue açın](https://github.com/snipeTR/trip-viewer/issues) ve birkaç örnek dosya adı paylaşın.
+
+Geliştirme, mimari, sürüm çıkarma ve katkı bilgileri için aşağıdaki İngilizce belgeye bakın.
+
+---
+
 <img src="icon/icon-128.png" align="left" width="96" alt="Trip Viewer icon"/>
 
 # Trip Viewer
@@ -60,11 +125,12 @@ By default on Linux, only the primary channel is shown — press **M** to enable
 The app is organized as a top tab bar — **Player**, **Scan**, **Review**, **Timelapse**, optional **Issues**, and **Places** — with a sidebar trip list and storage summary that's always visible. The sidebar collapses to a thin strip (click the **«** chevron in its header) when you want the video panels as large as possible.
 
 - **Multi-channel synchronized playback (1–4 channels)** — every camera on your dashcam plays in lockstep. Click a side view to make it the main view. Double-click the main view for fullscreen.
-- **Live GPS map** — an OpenStreetMap view tracks your vehicle position in real time as the video plays, with a trail showing where you've been. The map auto-pans to follow the vehicle but holds position during your own drag/zoom gestures so you can inspect a moment without being yanked back.
+- **Live GPS map** — an OpenStreetMap view tracks your vehicle position in real time as the video plays, with a trail showing where you've been. By default the map auto-pans to follow the vehicle but holds position during your own drag/zoom gestures so you can inspect a moment without being yanked back. Two optional toggles in the map's corner go further: **Lock centre** pins the vehicle to the middle of the map (the map slides under a fixed marker), and **Auto-zoom** widens the view as you speed up and tightens it as you slow down. Any manual pan or zoom turns both back off. Brief GPS dropouts (up to ~2 s) are bridged by dead-reckoning along the last heading and speed, so a short signal loss doesn't freeze or break the trace.
+- **Two-channel layout** — for front+rear dashcams the map tucks under the rear view so the front camera fills two-thirds of the width; three- and four-channel layouts give the map its own column.
 - **Speed and heading display** — real-time readouts overlaid on the map so you can see how fast you were going at any moment.
 - **Timeline with speed graph** — scrub through footage visually. The speed graph shows interesting moments (hard braking, acceleration) so you can jump right to them.
 - **Timelapse pipeline** — _(requires ffmpeg installed on your system; the app prompts for the binary the first time you use the feature.)_ Pre-render fast-playback versions of every trip at 8× (constant), 16× (slows to 1× during events), and 60× (slows to 8× during events). Event detection uses GPS-derived hard braking, hard acceleration, and turning thresholds, plus the dashcam's own event flag. Pick the tier and channel mix from the **Timelapse** tab; the Library view shows per-trip status and lets you rebuild any trip on demand. Once a trip has timelapses, you can delete the originals and keep playing the timelapse versions — see "Originals vs. timelapses" below. NVENC/NVDEC hardware encoding is used automatically when available.
-- **SD card import** — pull footage directly off your dashcam's SD card. Files are copied with SHA-256 integrity verification — with an estimated time remaining during staging — then organized into your library. The SD card is wiped after a successful verified transfer, ready to go back in your dashcam. Safety guards prevent the card from ever being used as its own destination (the import is refused if the source is, contains, or sits inside the library folder), and if a file can't be deleted during the wipe the app stops and asks — **Retry**, **Skip**, or **Cancel wipe** — instead of failing silently. Cancelling the wipe still keeps every copied, verified file in your library.
+- **SD card import** — pull footage directly off your dashcam's SD card. Files are copied with SHA-256 integrity verification — with an estimated time remaining during staging — then organized into your library. After the verified copy, a report shows what was transferred and asks whether to **erase the SD card** or **keep the files on it** — declining leaves the card completely untouched (the copies are already safe in your library). Safety guards prevent the card from ever being used as its own destination (the import is refused if the source is, contains, or sits inside the library folder), and if a file can't be deleted during a wipe the app stops and asks — **Retry**, **Skip**, or **Cancel wipe** — instead of failing silently.
 - **Import from a folder** — a non-destructive variant for files already on disk (e.g., manually copied off an SD card, or from a backup). Same trip detection and library organization, but nothing is wiped.
 - **Trip detection** — automatically groups your footage into trips based on recording timestamps. No manual organization needed.
 - **Recording-mode filter** — when your dashcam records in more than one mode (e.g. 70mai's Normal / Event / Parking / Time-lapse), the sidebar shows a filter row above the trip list. Click a mode to show only the trips that contain it; click **All** to clear. The mode is read from the filename, so it works the moment you open the library — no extra scan.
@@ -78,7 +144,7 @@ The app is organized as a top tab bar — **Player**, **Scan**, **Review**, **Ti
 - **Issues view** — a classified triage list for any file the scanner couldn't ingest. Each row is tagged by reason (invalid filename, unreadable, missing `moov`, corrupt box structure, no video track, other) with per-row reveal-in-folder, copy-path, and move-to-trash actions, plus a filter-gated bulk delete. The tab only appears when there's something to triage.
 - **Deletes go to the OS recycle bin** — everything the app deletes (segments, issue files, places) goes to your system trash, so nothing is permanently gone until you empty it yourself.
 - **Window state is remembered** — the app restores its last size, position, and maximized state across launches.
-- **Keyboard shortcuts** — Space to play/pause, arrow keys to seek, brackets to change speed. Click "Keyboard shortcuts" in the sidebar footer for the full list.
+- **Keyboard shortcuts** — Space to play/pause, arrow keys to seek, brackets to change speed. The shortcut list opens automatically on startup until you tick "Don't show this automatically on startup"; it's always reachable again from "Keyboard shortcuts" in the sidebar footer.
 - **Auto-updates** — the app checks for new versions on startup and offers a one-click update.
 
 ## Supported dashcams
