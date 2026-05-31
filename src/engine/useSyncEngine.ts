@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { SyncEngine } from "./SyncEngine";
+import type { CurveSegment } from "../utils/speedCurve";
 
 /**
  * Wire up a `SyncEngine` instance for the current segment.
@@ -9,11 +10,17 @@ import { SyncEngine } from "./SyncEngine";
  * @param channelLabels Ordered list of labels in the current segment
  *                     (canonical order — first entry is the sync master).
  * @param activeSegmentId The current segment id (changing this recreates the engine).
+ * @param channelCurves Per-channel speed curves keyed by label, for tiered
+ *                     playback. The master's curve maps file-time → concat-time;
+ *                     a slave's curve drives its coverage-gap hold/overlay.
+ *                     Empty map in Original mode. Captured at engine
+ *                     construction (stable per tier, so not a dep).
  */
 export function useSyncEngine(
   channelRefs: React.MutableRefObject<Map<string, HTMLVideoElement | null>>,
   channelLabels: string[],
   activeSegmentId: string | null,
+  channelCurves: Map<string, CurveSegment[]> = new Map(),
 ): SyncEngine | null {
   const [engine, setEngine] = useState<SyncEngine | null>(null);
   const engineRef = useRef<SyncEngine | null>(null);
@@ -54,7 +61,9 @@ export function useSyncEngine(
         includedLabels.push(label);
       }
 
-      const e = new SyncEngine(master, slaves, includedLabels);
+      const masterCurve = channelCurves.get(masterLabel) ?? null;
+      const slaveCurves = includedLabels.map((l) => channelCurves.get(l) ?? null);
+      const e = new SyncEngine(master, slaves, includedLabels, masterCurve, slaveCurves);
       e.start();
       engineRef.current = e;
       setEngine(e);

@@ -19,7 +19,14 @@ use tauri::State;
 /// startup backfill both compare against this; rows below the current
 /// version are re-extracted on the next encode (or backfill pass) when
 /// the original MP4 is still on disk.
-pub const GPS_PARSER_VERSION: i32 = 1;
+///
+/// v2: trip-stitched GPS now trims each segment's points to the
+/// segment's video duration. Parking-mode clips embed GPS for the whole
+/// parked interval (~90 min) into a ~180s video; the untrimmed points
+/// pushed later segments backwards in concat time, producing a
+/// non-monotonic track that desynced the map from the video. All v1
+/// rows must be re-stitched.
+pub const GPS_PARSER_VERSION: i32 = 2;
 
 /// A single path plus the camera brand the scanner identified for it. The
 /// frontend builds one of these per segment (by pairing each master channel's

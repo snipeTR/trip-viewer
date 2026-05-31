@@ -174,6 +174,130 @@ pub fn build_curve(
     out
 }
 
+/// Restrict a trip-level curve to the concat-time ranges a single
+/// channel actually has footage for, producing that channel's
+/// (possibly gappy) curve.
+///
+/// When a camera is off for part of a trip, its timelapse is built from
+/// real footage only — no black filler — so its curve must omit the
+/// missing ranges. Each `covered` range is intersected with the trip
+/// curve segments, carrying each segment's rate; ranges with no footage
+/// simply produce no segment, and the player reads the resulting
+/// non-contiguity as a gap (hold + black overlay) at playback time.
+///
+/// `covered` must be sorted and disjoint; pass *maximal* runs of present
+/// segments (merge adjacent present siblings) so the output curve stays
+/// minimal. A single full-trip range reproduces `trip_curve` exactly.
+pub fn restrict_curve_to_coverage(
+    trip_curve: &[CurveSegment],
+    covered: &[(f64, f64)],
+) -> Vec<CurveSegment> {
+    let mut out: Vec<CurveSegment> = Vec::new();
+    for &(cs, ce) in covered {
+        if ce <= cs {
+            continue;
+        }
+        for seg in trip_curve {
+            let start = seg.concat_start.max(cs);
+            let end = seg.concat_end.min(ce);
+            if end > start {
+                out.push(CurveSegment {
+                    concat_start: start,
+                    concat_end: end,
+                    rate: seg.rate,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.concat_start
+            .partial_cmp(&b.concat_start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// Minimum output length (seconds) for any single curve segment. A
+/// per-window NVENC encode whose output is shorter than this fails to
+/// open ("Error while opening encoder — incorrect parameters such as
+/// bit_rate, rate, width or height"). Empirically ~0.05 s outputs encode
+/// fine and ~0.025 s fail, so 0.1 s leaves a comfortable margin while
+/// staying far too short to perceive any pacing change.
+pub const MIN_WINDOW_OUTPUT_S: f64 = 0.1;
+
+/// Guarantee every segment produces at least `min_output_s` of output
+/// video, so the per-window encoder never chokes on a degenerately short
+/// window. A segment's output length is `span / rate`; coverage-boundary
+/// clipping and closely-spaced event windows can drop that below the
+/// floor (this is what made the gappy 16x/60x rear encodes fail, and is a
+/// latent hazard for any trip with near-adjacent events).
+///
+/// Two cases, neither of which changes a segment's *span* — so the curve
+/// still tiles its coverage exactly and stays aligned with the gap-closed
+/// source the encoder reads:
+///  - A sliver whose *span* is already below `min_output_s` can't reach
+///    the floor even at rate 1, so it's absorbed into the previous
+///    contiguous segment (kept at that segment's rate). Across a gap there
+///    is no previous neighbour, so an isolated sub-floor run is left at
+///    rate 1 — best effort; covered runs are whole clips and in practice
+///    always longer than this.
+///  - Otherwise the rate is lowered just enough that `span / rate >=
+///    min_output_s`. The affected stretch is always shorter than
+///    `min_output_s` of output, so the slight slowdown is invisible.
+pub fn sanitize_for_encode(curve: &[CurveSegment], min_output_s: f64) -> Vec<CurveSegment> {
+    let mut out: Vec<CurveSegment> = Vec::with_capacity(curve.len());
+    for seg in curve {
+        let span = seg.concat_end - seg.concat_start;
+        if span <= 0.0 {
+            continue;
+        }
+        // Absorb a too-short-span sliver into the previous contiguous segment.
+        if span < min_output_s {
+            if let Some(prev) = out.last_mut() {
+                if (seg.concat_start - prev.concat_end).abs() < 1e-6 {
+                    prev.concat_end = seg.concat_end;
+                    continue;
+                }
+            }
+        }
+        // Lower the rate just enough to reach the minimum output length.
+        let mut rate = seg.rate;
+        if (span / rate as f64) < min_output_s {
+            rate = ((span / min_output_s).floor() as u32).clamp(1, seg.rate);
+        }
+        out.push(CurveSegment {
+            concat_start: seg.concat_start,
+            concat_end: seg.concat_end,
+            rate,
+        });
+    }
+    out
+}
+
+/// Collapse the gaps out of a (possibly gappy) channel curve, yielding
+/// a contiguous curve in *source-time* — the timeline of the channel's
+/// gap-closed real-footage source that ffmpeg actually encodes from.
+///
+/// The persisted curve is in concat-time (with gaps where the camera was
+/// off) for the player; the encoder needs the same segments laid back-to-
+/// back from 0 so its per-window `-ss` seeks land in the real source. The
+/// per-segment spans and rates are identical — only the concat positions
+/// shift. A contiguous (full-coverage) curve is returned unchanged.
+pub fn collapse_gaps(curve: &[CurveSegment]) -> Vec<CurveSegment> {
+    let mut out = Vec::with_capacity(curve.len());
+    let mut cursor = 0.0;
+    for seg in curve {
+        let span = seg.concat_end - seg.concat_start;
+        out.push(CurveSegment {
+            concat_start: cursor,
+            concat_end: cursor + span,
+            rate: seg.rate,
+        });
+        cursor += span;
+    }
+    out
+}
+
 /// Render the curve as an ffmpeg `-filter_complex` body. Thin wrapper
 /// that calls `build_curve` then formats each segment into a
 /// `trim/setpts` chain concatenated with the `concat` filter.
@@ -407,6 +531,128 @@ mod tests {
         assert!(json.contains("concatEnd"));
         let parsed: Vec<CurveSegment> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, curve);
+    }
+
+    // ── restrict_curve_to_coverage ────────────────────────────────────
+
+    fn seg(s: f64, e: f64, r: u32) -> CurveSegment {
+        CurveSegment { concat_start: s, concat_end: e, rate: r }
+    }
+
+    // Trip curve used across the coverage tests: 16x with a 1x event at
+    // [60,75], like the player examples.
+    fn trip() -> Vec<CurveSegment> {
+        vec![seg(0.0, 60.0, 16), seg(60.0, 75.0, 1), seg(75.0, 300.0, 16)]
+    }
+
+    #[test]
+    fn restrict_full_coverage_reproduces_trip_curve() {
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 300.0)]);
+        assert_eq!(got, trip());
+    }
+
+    #[test]
+    fn restrict_middle_gap_drops_event_inside_gap() {
+        // Camera off over [30,90] — the [60,75] event is entirely inside
+        // the gap, so it must not appear in the channel's curve.
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 30.0), (90.0, 300.0)]);
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(90.0, 300.0, 16)]);
+    }
+
+    #[test]
+    fn restrict_leading_gap() {
+        let got = restrict_curve_to_coverage(&trip(), &[(90.0, 300.0)]);
+        assert_eq!(got, vec![seg(90.0, 300.0, 16)]);
+    }
+
+    #[test]
+    fn restrict_keeps_partial_event_overlap() {
+        // Coverage ends mid-event: keep the base run and the clipped event.
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 70.0)]);
+        assert_eq!(got, vec![seg(0.0, 60.0, 16), seg(60.0, 70.0, 1)]);
+    }
+
+    #[test]
+    fn sanitize_clamps_rate_of_short_high_speed_fragment() {
+        // The May 18 rear failure: an isolated 0.4s covered run at 16x →
+        // 0.025s output → NVENC won't open. Clamp to 0.4/0.1 = 4x.
+        let got = sanitize_for_encode(&[seg(100.0, 100.4, 16)], 0.1);
+        assert_eq!(got, vec![seg(100.0, 100.4, 4)]);
+        // At 60x the same fragment also clamps to 4x.
+        let got60 = sanitize_for_encode(&[seg(100.0, 100.4, 60)], 0.1);
+        assert_eq!(got60, vec![seg(100.0, 100.4, 4)]);
+    }
+
+    #[test]
+    fn sanitize_leaves_long_segments_untouched() {
+        // 6s @ 60x = exactly 0.1s output → at the floor, not below → kept.
+        assert_eq!(
+            sanitize_for_encode(&[seg(0.0, 6.0, 60)], 0.1),
+            vec![seg(0.0, 6.0, 60)]
+        );
+        // A normal long base run is well above the floor.
+        assert_eq!(
+            sanitize_for_encode(&[seg(0.0, 300.0, 16)], 0.1),
+            vec![seg(0.0, 300.0, 16)]
+        );
+    }
+
+    #[test]
+    fn sanitize_absorbs_subfloor_sliver_into_previous_contiguous_segment() {
+        // A 0.02s base sliver between two segments (e.g. event-boundary
+        // clipping) is absorbed into the previous segment, not encoded.
+        let got = sanitize_for_encode(
+            &[seg(0.0, 60.0, 16), seg(60.0, 60.02, 16), seg(60.02, 75.0, 1)],
+            0.1,
+        );
+        assert_eq!(got, vec![seg(0.0, 60.02, 16), seg(60.02, 75.0, 1)]);
+    }
+
+    #[test]
+    fn sanitize_does_not_merge_across_a_gap() {
+        // A sub-floor isolated run after a gap has no contiguous prev, so
+        // it's left at rate 1 (best effort) rather than merged across the gap.
+        let got = sanitize_for_encode(&[seg(0.0, 30.0, 16), seg(90.0, 90.05, 16)], 0.1);
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(90.0, 90.05, 1)]);
+    }
+
+    #[test]
+    fn collapse_gaps_makes_curve_contiguous_preserving_spans_and_rates() {
+        let gappy = vec![seg(0.0, 30.0, 16), seg(90.0, 300.0, 16)];
+        let got = collapse_gaps(&gappy);
+        // [0,30] stays; [90,300] (span 210) shifts to [30,240].
+        assert_eq!(got, vec![seg(0.0, 30.0, 16), seg(30.0, 240.0, 16)]);
+    }
+
+    #[test]
+    fn collapse_gaps_is_noop_for_contiguous_curve() {
+        assert_eq!(collapse_gaps(&trip()), trip());
+    }
+
+    #[test]
+    fn restrict_then_collapse_full_coverage_is_identity() {
+        // Full-coverage channels must encode and persist exactly as today.
+        let persist = restrict_curve_to_coverage(&trip(), &[(0.0, 300.0)]);
+        let source = collapse_gaps(&persist);
+        assert_eq!(persist, trip());
+        assert_eq!(source, trip());
+    }
+
+    #[test]
+    fn restrict_empty_coverage_is_empty() {
+        assert!(restrict_curve_to_coverage(&trip(), &[]).is_empty());
+        // Degenerate zero-width ranges contribute nothing.
+        assert!(restrict_curve_to_coverage(&trip(), &[(50.0, 50.0)]).is_empty());
+    }
+
+    #[test]
+    fn restrict_output_is_sorted_and_within_coverage() {
+        let got = restrict_curve_to_coverage(&trip(), &[(0.0, 30.0), (90.0, 300.0)]);
+        for w in got.windows(2) {
+            assert!(w[0].concat_start <= w[1].concat_start);
+        }
+        // Nothing leaks into the [30,90] gap.
+        assert!(got.iter().all(|s| s.concat_end <= 30.0 || s.concat_start >= 90.0));
     }
 
     // ── compose_filter ────────────────────────────────────────────────

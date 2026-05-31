@@ -1,5 +1,6 @@
 import { forwardRef, useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
+import { useStore } from "../../state/store";
 
 // Diagnostic toggles. Both default off so production builds stay silent.
 //
@@ -47,6 +48,10 @@ export const ChannelPanel = forwardRef<HTMLVideoElement, Props>(
   function ChannelPanel({ label, src, isMaster, onClick, onDoubleClick }, ref) {
     const [error, setError] = useState<string | null>(null);
     const [ready, setReady] = useState(false);
+    // True while this channel is in a coverage gap (camera was off for
+    // this stretch in tiered playback). The SyncEngine holds the
+    // `<video>`; we paint black over it. Always false in Original mode.
+    const gapped = useStore((s) => s.gappedChannels[label] ?? false);
     // `showLoading` is `!ready` debounced by LOADING_OVERLAY_DELAY_MS.
     // Fast loads (the common case on Windows/Chromium and on macOS now
     // that the loopback HTTP server feeds AVFoundation moov immediately)
@@ -234,6 +239,12 @@ export const ChannelPanel = forwardRef<HTMLVideoElement, Props>(
             setError(map[code] ?? `playback error ${code}`);
           }}
         />
+
+        {gapped && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black text-xs text-neutral-600">
+            camera off
+          </div>
+        )}
 
         <div className="absolute left-2 top-2 flex flex-col items-start gap-1">
           <div

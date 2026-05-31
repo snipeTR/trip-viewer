@@ -87,6 +87,61 @@ export function concatToFile(
 }
 
 /**
+ * Coverage gaps. A per-channel curve may be NON-contiguous: when a
+ * camera (commonly the rear) is off for part of a trip, that channel's
+ * timelapse is built from its real footage only, with no black filler,
+ * so the curve has no segment over the missing concat-time range. A
+ * "gap" is simply a discontinuity between consecutive segments
+ * (`next.concatStart > prev.concatEnd`) beyond a small epsilon, plus the
+ * spans before the first segment and after the last.
+ *
+ * Front (or any full-coverage channel) is contiguous, so it never has
+ * gaps and `coverageAt` always reports `covered: true` in-range —
+ * identical behavior to the pre-gap curves already on disk.
+ */
+const GAP_EPSILON_S = 0.05;
+
+export interface Coverage {
+  /** True when this channel has real footage at the given concat-time. */
+  covered: boolean;
+  /** File-time to use. When covered, the mapped position in the MP4.
+   *  When in a gap, the position at the *leading edge* of the gap (the
+   *  last covered frame) — where a held <video> should sit so that
+   *  resuming on gap-exit continues contiguously with no seek. */
+  fileTime: number;
+}
+
+/**
+ * Map a concat-time to this channel's coverage: whether the channel has
+ * footage there, and the file-time to use. The player holds + black-
+ * overlays a channel while `covered` is false, and lets it free-run
+ * while true. The file is gap-closed, so the `fileTime` returned at a
+ * gap's leading edge is exactly where playback resumes on gap-exit.
+ */
+export function coverageAt(
+  concatTime: number,
+  curve: CurveSegment[],
+): Coverage {
+  if (curve.length === 0) return { covered: false, fileTime: 0 };
+  let cumulativeFile = 0;
+  for (const seg of curve) {
+    // Before this segment's start (a gap, or before the first segment):
+    // hold at the file position reached so far (end of prior coverage).
+    if (concatTime < seg.concatStart - GAP_EPSILON_S) {
+      return { covered: false, fileTime: cumulativeFile };
+    }
+    const segFileSpan = (seg.concatEnd - seg.concatStart) / seg.rate;
+    if (concatTime <= seg.concatEnd + GAP_EPSILON_S) {
+      const offset = Math.max(0, concatTime - seg.concatStart);
+      return { covered: true, fileTime: cumulativeFile + offset / seg.rate };
+    }
+    cumulativeFile += segFileSpan;
+  }
+  // Past the last covered segment.
+  return { covered: false, fileTime: cumulativeFile };
+}
+
+/**
  * Convenience: a single-segment curve at a constant rate covering
  * `totalDurationS` of concat-time. Used for the fallback when a
  * timelapse_jobs row has no persisted curve JSON (legacy data), and
@@ -103,6 +158,15 @@ export function linearCurve(
       rate: Math.max(1, rate),
     },
   ];
+}
+
+/** Base rate (concat-seconds per file-second) for a fixed tier. Returns
+ *  null for unknown labels. */
+export function tierBaseRate(tier: string): number | null {
+  if (tier === "8x") return 8;
+  if (tier === "16x") return 16;
+  if (tier === "60x") return 60;
+  return null;
 }
 
 /** Schema version we know how to read. Mirrors Rust's

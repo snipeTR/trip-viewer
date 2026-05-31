@@ -28,10 +28,11 @@ export interface TimelapseJobRow {
   encoderUsed: string | null;
   createdAtMs: number;
   completedAtMs: number | null;
-  /** Number of source segments that were filled with black-frame
-   *  placeholders because the real sibling file was missing. Zero
-   *  for clean runs. Non-zero means the output is valid and in sync
-   *  but shows black on this channel for those segments. */
+  /** Number of segments where this channel had no footage (the camera
+   *  was off). Zero for full-coverage channels. The timelapse encodes
+   *  the real footage only (fast GPU path) and the player shows a black
+   *  overlay across these gaps. (Column name predates the
+   *  no-black-placeholder redesign.) */
   paddedCount: number;
   /** JSON-serialized `CurveSegment[]` produced at encode time. Null
    *  for legacy rows (pre-speed-curve column) and pending/failed
@@ -113,6 +114,40 @@ export function listTimelapseJobs(): Promise<TimelapseJobRow[]> {
   return invoke<TimelapseJobRow[]>("list_timelapse_jobs");
 }
 
+/** Live on-disk archive check for one trip. Used to hard-block
+ *  delete-originals when a usable timelapse doesn't actually exist on
+ *  disk (file deleted, or — `archiveReachable=false` — the drive is
+ *  unplugged, in which case the result is "unknown", not "missing"). */
+export interface ArchiveOnDisk {
+  doneJobs: number;
+  filesPresent: number;
+  missingFiles: string[];
+  archiveReachable: boolean;
+}
+
+export function tripArchiveOnDisk(tripId: string): Promise<ArchiveOnDisk> {
+  return invoke<ArchiveOnDisk>("trip_archive_on_disk", { tripId });
+}
+
+export interface PruneSummary {
+  trashed: number;
+  bytesReclaimed: number;
+  sample: string[];
+}
+
+/** Move every orphan timelapse file (DB-unreferenced) under
+ *  `<archive>/Timelapses/` to trash. */
+export function pruneOrphanTimelapseFiles(): Promise<PruneSummary> {
+  return invoke<PruneSummary>("prune_orphan_timelapse_files");
+}
+
+/** Read-only count of orphan timelapse files. Drives the
+ *  "needs attention" badge on the Prune button. */
+export function countOrphanTimelapseFiles(): Promise<number> {
+  return invoke<number>("count_orphan_timelapse_files");
+}
+
+
 /**
  * File-picker for the ffmpeg binary. Filters to .exe on Windows; Unix
  * systems allow any file since the binary has no extension. Returns
@@ -152,4 +187,13 @@ export function onTimelapseDone(
   cb: (e: TimelapseDoneEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<TimelapseDoneEvent>("timelapse:done", (e) => cb(e.payload));
+}
+
+/** Bracketed around the implicit pre-encode scan: fires `true` when the
+ *  scan starts, `false` when it ends. Lets the UI show "scanning…"
+ *  before `timelapse:start` arrives with the encode work total. */
+export function onTimelapseScanning(
+  cb: (active: boolean) => void,
+): Promise<UnlistenFn> {
+  return listen<boolean>("timelapse:scanning", (e) => cb(e.payload));
 }

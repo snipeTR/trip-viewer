@@ -6,10 +6,42 @@ import type {
   TimelapseJobScope,
   TimelapseTier,
 } from "../../ipc/timelapse";
+import { pruneOrphanTimelapseFiles } from "../../ipc/timelapse";
+import { formatBytes } from "../../utils/format";
 import { formatTripStart } from "../../utils/format";
 import { parseCurveJson } from "../../utils/speedCurve";
+import { fallbackCurveForTier } from "../../utils/tripTime";
 import { TripActionsMenu } from "../trip/TripActionsMenu";
 import { FfmpegConfig } from "./FfmpegConfig";
+
+// State used by both the per-trip status pills and the library-wide
+// "Overall coverage" summary. Maps onto the same colors and glyphs the
+// Scan view uses so the visual vocabulary stays consistent across tabs.
+type CoverageState = "done" | "running" | "partial" | "failed" | "notRun";
+
+const COVERAGE_PILL_CLASSES: Record<CoverageState, string> = {
+  done: "border-emerald-700 bg-emerald-950/60 text-emerald-200",
+  running: "border-sky-700 bg-sky-950/60 text-sky-200",
+  partial: "border-orange-700 bg-orange-950/60 text-orange-200",
+  failed: "border-red-700 bg-red-950/60 text-red-200",
+  notRun: "border-neutral-700 bg-neutral-900 text-neutral-500",
+};
+
+const COVERAGE_PILL_GLYPH: Record<CoverageState, string> = {
+  done: "✓",
+  running: "▶",
+  partial: "◐",
+  failed: "✗",
+  notRun: "○",
+};
+
+const COVERAGE_STATE_LABEL: Record<CoverageState, string> = {
+  done: "playable",
+  running: "running",
+  partial: "partial",
+  failed: "failed",
+  notRun: "not run",
+};
 
 const TIER_OPTIONS: {
   value: TimelapseTier;
@@ -82,6 +114,7 @@ export function TimelapseView() {
   const ffmpegPath = useStore((s) => s.ffmpegPath);
   const caps = useStore((s) => s.ffmpegCapabilities);
   const running = useStore((s) => s.timelapseRunning);
+  const scanning = useStore((s) => s.timelapseScanning);
   const progress = useStore((s) => s.timelapseProgress);
   const lastResult = useStore((s) => s.timelapseLastResult);
   const startMs = useStore((s) => s.timelapseStartMs);
@@ -94,6 +127,13 @@ export function TimelapseView() {
   const setSourceMode = useStore((s) => s.setSourceMode);
 
   const [showConfig, setShowConfig] = useState(false);
+  const [pruneState, setPruneState] = useState<
+    | { kind: "idle" }
+    | { kind: "running" }
+    | { kind: "done"; trashed: number; bytes: number; sample: string[] }
+    | { kind: "error"; message: string }
+  >({ kind: "idle" });
+  const orphanCount = useStore((s) => s.orphanTimelapseCount);
   const [tiers, setTiers] = useState<Set<TimelapseTier>>(
     new Set(["8x", "16x", "60x"]),
   );
@@ -170,38 +210,116 @@ export function TimelapseView() {
     return m;
   }, [jobs]);
 
+  // Library-wide aggregate: for each tier, how many trips are
+  // playable / running / partial / failed-only / not-yet-run. "Done"
+  // is defined as the per-trip Play button's definition (any channel
+  // completed at this tier) — that's what makes the tier usable to
+  // the user. Permanent CameraDoesNotRecord failures don't prevent
+  // "done" so single-channel dashcams still read as playable once
+  // Front lands.
+  const overallByTier = useMemo(() => {
+    const tally: Record<TimelapseTier, Record<CoverageState, number>> = {
+      "8x": { done: 0, running: 0, partial: 0, failed: 0, notRun: 0 },
+      "16x": { done: 0, running: 0, partial: 0, failed: 0, notRun: 0 },
+      "60x": { done: 0, running: 0, partial: 0, failed: 0, notRun: 0 },
+    };
+    for (const trip of trips) {
+      const tripJobs = jobsByTrip[trip.id] ?? [];
+      for (const tier of ["8x", "16x", "60x"] as const) {
+        const tjobs = tripJobs.filter((j) => j.tier === tier);
+        const doneCount = tjobs.filter((j) => j.status === "done").length;
+        const runningCount = tjobs.filter(
+          (j) => j.status === "running",
+        ).length;
+        const pendingCount = tjobs.filter(
+          (j) => j.status === "pending",
+        ).length;
+        const failedCount = tjobs.filter(
+          (j) => j.status === "failed",
+        ).length;
+        let state: CoverageState;
+        if (runningCount > 0) {
+          state = "running";
+        } else if (doneCount > 0 && pendingCount === 0) {
+          state = "done";
+        } else if (doneCount > 0) {
+          state = "partial";
+        } else if (failedCount > 0 && pendingCount === 0 && tjobs.length > 0) {
+          state = "failed";
+        } else {
+          state = "notRun";
+        }
+        tally[tier][state] += 1;
+      }
+    }
+    return tally;
+  }, [trips, jobsByTrip]);
+
   const canStart =
     configured && !running && tiers.size > 0 && channels.size > 0;
 
-  async function onStart() {
+  // Missing sibling channels no longer carry any penalty (no black-
+  // placeholder padding, no slow CPU path — they're encoded real-footage-
+  // only on the fast GPU pipeline and shown as a black overlay at
+  // playback), so there's nothing to warn about pre-encode. Just start.
+  async function startEncode(args: Parameters<typeof startRun>[0]) {
     setError(null);
     try {
-      await startRun({
-        tripIds: null, // null = every trip in the library
-        tiers: Array.from(tiers),
-        channels: Array.from(channels),
-        scope,
-      });
+      await startRun(args);
     } catch (e) {
       setError(String(e));
     }
   }
 
-  async function onRebuildTrip(tripId: string) {
-    setError(null);
-    try {
-      await startRun({
-        tripIds: [tripId],
-        tiers: Array.from(tiers),
-        channels: Array.from(channels),
-        // newOnly would no-op for an already-done trip, which is the
-        // opposite of what "Rebuild" means. Coerce to rebuildAll; pass
-        // failedOnly/rebuildAll through unchanged.
-        scope: scope === "newOnly" ? "rebuildAll" : scope,
-      });
-    } catch (e) {
-      setError(String(e));
+  async function onStart() {
+    await startEncode({
+      tripIds: null, // null = every trip in the library
+      tiers: Array.from(tiers),
+      channels: Array.from(channels),
+      scope,
+    });
+  }
+
+  async function onPruneOrphans() {
+    if (
+      !window.confirm(
+        "Move orphan timelapse files to trash?\n\n" +
+          "These are .mp4 files under <archive>/Timelapses/ whose trip_id " +
+          "matches no row in the database — they're left over from a trip " +
+          "rename or trip merge and the app no longer references them. " +
+          "Files go to the OS trash so you can recover them if needed.",
+      )
+    ) {
+      return;
     }
+    setPruneState({ kind: "running" });
+    try {
+      const result = await pruneOrphanTimelapseFiles();
+      setPruneState({
+        kind: "done",
+        trashed: result.trashed,
+        bytes: result.bytesReclaimed,
+        sample: result.sample,
+      });
+      // Badge tracks live disk state — refresh so it reflects what
+      // the prune just did, including any orphans that couldn't be
+      // trashed (errors are logged backend-side and stay counted).
+      void useStore.getState().refreshOrphanCount();
+    } catch (e) {
+      setPruneState({ kind: "error", message: String(e) });
+    }
+  }
+
+  async function onRebuildTrip(tripId: string) {
+    await startEncode({
+      tripIds: [tripId],
+      tiers: Array.from(tiers),
+      channels: Array.from(channels),
+      // newOnly would no-op for an already-done trip, which is the
+      // opposite of what "Rebuild" means. Coerce to rebuildAll; pass
+      // failedOnly/rebuildAll through unchanged.
+      scope: scope === "newOnly" ? "rebuildAll" : scope,
+    });
   }
 
   const rebuildDisabledReason = !configured
@@ -211,8 +329,8 @@ export function TimelapseView() {
       : tiers.size === 0
         ? "Pick at least one tier"
         : channels.size === 0
-          ? "Pick at least one channel"
-          : null;
+            ? "Pick at least one channel"
+            : null;
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-neutral-950 text-neutral-100">
@@ -371,35 +489,51 @@ export function TimelapseView() {
               Progress
             </h2>
             <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
-              <div className="mb-2 flex h-2 w-full overflow-hidden rounded-full bg-neutral-800">
-                <div
-                  className="h-full bg-sky-500 transition-all"
-                  style={{ width: `${donePct}%` }}
-                />
-                <div
-                  className="h-full bg-red-500 transition-all"
-                  style={{ width: `${failedPct}%` }}
-                />
-              </div>
-              <div className="flex items-center justify-between text-xs text-neutral-400">
-                <span>
-                  {doneCount} / {total} ({pct}%)
-                </span>
-                <div className="flex items-center gap-3">
-                  {etaLabel && (
+              {scanning ? (
+                // Pre-encode scan phase: no count yet, just a heartbeat
+                // bar so the user knows the worker is alive. Replaced
+                // by the real progress UI when `timelapse:start` arrives.
+                <>
+                  <div className="mb-2 h-2 w-full overflow-hidden rounded-full bg-neutral-800">
+                    <div className="h-full w-1/3 animate-pulse bg-sky-500/60" />
+                  </div>
+                  <div className="text-xs text-neutral-400">
+                    Scanning library for new or changed trips…
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="mb-2 flex h-2 w-full overflow-hidden rounded-full bg-neutral-800">
+                    <div
+                      className="h-full bg-sky-500 transition-all"
+                      style={{ width: `${donePct}%` }}
+                    />
+                    <div
+                      className="h-full bg-red-500 transition-all"
+                      style={{ width: `${failedPct}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between text-xs text-neutral-400">
                     <span>
-                      ETA{" "}
-                      <span className="text-neutral-200">{etaLabel}</span>
+                      {doneCount} / {total} ({pct}%)
                     </span>
+                    <div className="flex items-center gap-3">
+                      {etaLabel && (
+                        <span>
+                          ETA{" "}
+                          <span className="text-neutral-200">{etaLabel}</span>
+                        </span>
+                      )}
+                      <span>{progress?.failed ?? 0} failed</span>
+                    </div>
+                  </div>
+                  {progress?.currentTripId && (
+                    <div className="mt-1 truncate text-xs text-neutral-500">
+                      trip {progress.currentTripId.slice(0, 8)}… · tier{" "}
+                      {progress.currentTier} · channel {progress.currentChannel}
+                    </div>
                   )}
-                  <span>{progress?.failed ?? 0} failed</span>
-                </div>
-              </div>
-              {progress?.currentTripId && (
-                <div className="mt-1 truncate text-xs text-neutral-500">
-                  trip {progress.currentTripId.slice(0, 8)}… · tier{" "}
-                  {progress.currentTier} · channel {progress.currentChannel}
-                </div>
+                </>
               )}
             </div>
           </section>
@@ -422,6 +556,70 @@ export function TimelapseView() {
                 {lastResult.failed} failed
               </span>
             </div>
+          </section>
+        )}
+
+        {trips.length > 0 && (
+          <section className="mb-6">
+            <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-neutral-400">
+              Overall coverage
+            </h2>
+            <div className="overflow-hidden rounded-md border border-neutral-800">
+              <table className="w-full text-sm">
+                <tbody>
+                  {(["8x", "16x", "60x"] as const).map((tier) => {
+                    const t = overallByTier[tier];
+                    const tierOpt = TIER_OPTIONS.find((o) => o.value === tier);
+                    const allCells: { state: CoverageState; count: number }[] = [
+                      { state: "done", count: t.done },
+                      { state: "running", count: t.running },
+                      { state: "partial", count: t.partial },
+                      { state: "failed", count: t.failed },
+                      { state: "notRun", count: t.notRun },
+                    ];
+                    const cells = allCells.filter(
+                      (c, i) => i === 0 || c.count > 0,
+                    );
+                    return (
+                      <tr
+                        key={tier}
+                        className="border-t border-neutral-800 first:border-t-0"
+                      >
+                        <td className="px-3 py-2 text-neutral-200">
+                          {tierOpt?.label.split(" — ")[0] ?? tier}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {cells.map(({ state, count }) => (
+                              <span
+                                key={state}
+                                className={clsx(
+                                  "inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium",
+                                  COVERAGE_PILL_CLASSES[state],
+                                )}
+                              >
+                                <span aria-hidden="true">
+                                  {COVERAGE_PILL_GLYPH[state]}
+                                </span>
+                                {count} {COVERAGE_STATE_LABEL[state]}
+                              </span>
+                            ))}
+                            <span className="ml-1 text-xs text-neutral-500">
+                              of {trips.length} trips
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-1 text-[11px] text-neutral-500">
+              &quot;Playable&quot; means at least one channel completed at this
+              tier — single-channel dashcams still count as playable once the
+              Front output lands.
+            </p>
           </section>
         )}
 
@@ -517,15 +715,15 @@ export function TimelapseView() {
                               )}
                               {maxPadded > 0 && (
                                 <span
-                                  className="text-amber-300"
+                                  className="text-neutral-400"
                                   title={
-                                    `Black-frame padding was applied for ${maxPadded} ` +
-                                    "segment(s) because a sibling file was missing. " +
-                                    "The output plays and stays in sync; the affected " +
-                                    "stretch shows a black screen on the padded channel(s)."
+                                    `A camera was off for ${maxPadded} segment(s) of ` +
+                                    "this trip. The timelapse encodes the footage that " +
+                                    "exists (fast GPU path, no penalty) and shows a black " +
+                                    "overlay on that channel for those stretches."
                                   }
                                 >
-                                  ⚠ {maxPadded} gap
+                                  {maxPadded} gap
                                   {maxPadded === 1 ? "" : "s"}
                                 </span>
                               )}
@@ -551,11 +749,13 @@ export function TimelapseView() {
                                         j.tripId === t.id &&
                                         j.tier === tier &&
                                         j.status === "done" &&
-                                        j.speedCurveJson,
+                                        j.outputPath,
                                     );
-                                    const curve = parseCurveJson(
-                                      job?.speedCurveJson ?? null,
-                                    );
+                                    if (!job) return;
+                                    const curve =
+                                      parseCurveJson(
+                                        job.speedCurveJson ?? null,
+                                      ) ?? fallbackCurveForTier(t, tier);
                                     if (!curve) return;
                                     selectTrip(t.id);
                                     setSourceMode(tier, curve);
@@ -611,6 +811,90 @@ export function TimelapseView() {
             </div>
           </section>
         )}
+        {configured && (
+          <section className="mb-6">
+            <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-neutral-400">
+              Maintenance
+            </h2>
+            <div
+              className={clsx(
+                "rounded-md border p-3 text-sm",
+                orphanCount > 0
+                  ? "border-amber-700/60 bg-amber-950/30"
+                  : "border-neutral-800 bg-neutral-900",
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="font-medium text-neutral-200">
+                      Prune orphan files
+                    </div>
+                    {orphanCount > 0 && (
+                      <span
+                        className="rounded-full bg-amber-600/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200"
+                        title="Orphan timelapse files found on disk — click Prune to reclaim space."
+                      >
+                        {orphanCount} found
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-xs text-neutral-400">
+                    Moves on-disk timelapse files whose trip_id matches no
+                    database row to the OS trash. Reclaims space from
+                    files left behind by trip renames or merges. Files go
+                    to trash, not permanent deletion.
+                  </p>
+                </div>
+                <button
+                  onClick={() => void onPruneOrphans()}
+                  disabled={
+                    running || pruneState.kind === "running" || orphanCount === 0
+                  }
+                  className={clsx(
+                    "shrink-0 rounded-md px-3 py-1.5 text-sm font-medium",
+                    running || pruneState.kind === "running" || orphanCount === 0
+                      ? "cursor-not-allowed bg-neutral-800 text-neutral-500"
+                      : orphanCount > 0
+                        ? "bg-amber-700 text-white hover:bg-amber-600"
+                        : "bg-neutral-700 text-neutral-100 hover:bg-neutral-600",
+                  )}
+                  title={
+                    running
+                      ? "Wait for the current encode to finish first"
+                      : orphanCount === 0
+                        ? "No orphan files to prune"
+                        : undefined
+                  }
+                >
+                  {pruneState.kind === "running" ? "Pruning…" : "Prune"}
+                </button>
+              </div>
+              {pruneState.kind === "done" && (
+                <div className="mt-2 rounded-md bg-emerald-950/60 px-3 py-2 text-xs text-emerald-200">
+                  Moved <strong>{pruneState.trashed}</strong>{" "}
+                  {pruneState.trashed === 1 ? "file" : "files"} to trash
+                  {pruneState.bytes > 0 && (
+                    <>
+                      {" "}
+                      · reclaimed{" "}
+                      <strong>{formatBytes(pruneState.bytes)}</strong>
+                    </>
+                  )}
+                  {pruneState.trashed === 0 && (
+                    <> — no orphans to clean up</>
+                  )}
+                  .
+                </div>
+              )}
+              {pruneState.kind === "error" && (
+                <div className="mt-2 rounded-md bg-red-950/60 px-3 py-2 text-xs text-red-200">
+                  Prune failed: {pruneState.message}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
       </div>
 
       <footer className="flex items-center justify-end gap-2 border-t border-neutral-800 px-4 py-3">
@@ -626,10 +910,10 @@ export function TimelapseView() {
             onClick={() => void onStart()}
             disabled={!canStart}
             className={clsx(
-              "rounded-md px-4 py-2 text-sm font-medium",
-              canStart
-                ? "bg-sky-600 text-white hover:bg-sky-500"
-                : "cursor-not-allowed bg-neutral-800 text-neutral-500",
+              "inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium",
+              !canStart
+                ? "cursor-not-allowed bg-neutral-800 text-neutral-500"
+                : "bg-sky-600 text-white hover:bg-sky-500",
             )}
             title={
               !configured

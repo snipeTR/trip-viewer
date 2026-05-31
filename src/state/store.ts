@@ -39,6 +39,7 @@ import {
 } from "../ipc/scanner";
 import {
   cancelTimelapse as ipcCancelTimelapse,
+  countOrphanTimelapseFiles as ipcCountOrphanTimelapseFiles,
   getTimelapseSettings as ipcGetTimelapseSettings,
   listTimelapseJobs as ipcListTimelapseJobs,
   startTimelapse as ipcStartTimelapse,
@@ -47,6 +48,7 @@ import {
   getLibraryStorageSummary as ipcGetLibraryStorageSummary,
   type LibraryStorageSummary,
 } from "../ipc/library";
+import { loadTripGps as ipcLoadTripGps } from "../ipc/gps";
 import type { CurveSegment } from "../utils/speedCurve";
 
 export type AppStatus = "idle" | "loading" | "ready" | "error";
@@ -106,6 +108,11 @@ export interface PlaybackSlice {
    *  in Original mode. Loaded from `timelapse_jobs.speed_curve_json`
    *  when a tier is selected. */
   activeSpeedCurve: CurveSegment[] | null;
+  /** Channel labels currently inside a coverage gap (the camera was off
+   *  for this stretch of the trip). In tiered playback the SyncEngine
+   *  holds that channel's `<video>` and `ChannelPanel` draws a black
+   *  overlay. Empty in Original mode and for full-coverage channels. */
+  gappedChannels: Record<string, boolean>;
   volume: number;
   muted: boolean;
   showDriftHud: boolean;
@@ -225,6 +232,11 @@ export interface AppState
    *  bytes on disk. Errors are swallowed — a stale total is better
    *  than a crashed sidebar. */
   refreshLibrarySummary: () => Promise<void>;
+  /** Re-fetch a trip's persisted (trip-stitched) GPS into
+   *  `tripGpsByTrip`. Called after a rebuild so the map + speed graph
+   *  populate without the user having to close and reopen the trip
+   *  (the encoder persists fresh GPS during the rebuild). */
+  refreshTripGps: (tripId: string) => Promise<void>;
   /** Toggle the reclaimable-only filter in the sidebar trip list. */
   setReclaimableFilter: (enabled: boolean) => void;
   setTripModeFilter: (mode: RecordingMode | "all") => void;
@@ -280,6 +292,8 @@ export interface AppState
     mode: PlaybackSlice["sourceMode"],
     curve: CurveSegment[] | null,
   ) => void;
+  /** Mark/unmark a channel as currently gapped (SyncEngine drives this). */
+  setChannelGapped: (label: string, gapped: boolean) => void;
 }
 
 export const useStore = create<AppState>((set) => ({
@@ -308,6 +322,7 @@ export const useStore = create<AppState>((set) => ({
   primaryChannel: null,
   sourceMode: "original",
   activeSpeedCurve: null,
+  gappedChannels: {},
 
   importStatus: "idle",
   importSources: [],
@@ -337,10 +352,12 @@ export const useStore = create<AppState>((set) => ({
   scanCoverage: [],
 
   timelapseRunning: false,
+  timelapseScanning: false,
   timelapseProgress: null,
   timelapseLastResult: null,
   timelapseStartMs: null,
   timelapseJobs: [],
+  orphanTimelapseCount: 0,
   ffmpegPath: null,
   ffmpegCapabilities: null,
 
@@ -795,6 +812,7 @@ export const useStore = create<AppState>((set) => ({
       // its own speed curves (different tiers, different event windows).
       sourceMode: "original",
       activeSpeedCurve: null,
+      gappedChannels: {},
       // Picking a trip implies the user wants to watch it — bail out of
       // the issues view if they were reading it.
       mainView: "player",
@@ -816,6 +834,7 @@ export const useStore = create<AppState>((set) => ({
       currentTime: 0,
       isPlaying: false,
       primaryChannel: null,
+      gappedChannels: {},
       mainView: "player",
     }),
   setCurrentTime: (currentTime) => set({ currentTime }),
@@ -831,7 +850,15 @@ export const useStore = create<AppState>((set) => ({
    *  in PlayerShell's seekTripTime helper. This action just swaps
    *  the flags atomically. */
   setSourceMode: (sourceMode, activeSpeedCurve) =>
-    set({ sourceMode, activeSpeedCurve }),
+    // Switching source axis invalidates any gap overlays — the engine
+    // rebuilds and re-derives them for the new lineup.
+    set({ sourceMode, activeSpeedCurve, gappedChannels: {} }),
+
+  setChannelGapped: (label, gapped) =>
+    set((s) => {
+      if (!!s.gappedChannels[label] === gapped) return s; // no-op, avoid churn
+      return { gappedChannels: { ...s.gappedChannels, [label]: gapped } };
+    }),
 
   refreshTripTags: async (tripId) => {
     set({ tagsLoadingTripId: tripId });
@@ -928,8 +955,33 @@ export const useStore = create<AppState>((set) => ({
       // Job completions push timelapse_bytes up and may flip a trip
       // into the reclaimable set — refresh totals together.
       void useStore.getState().refreshLibrarySummary();
+      // Rebuilds and merges can create orphan files (old trip_id
+      // filenames left over). Keep the Prune badge accurate without
+      // requiring the user to visit the Timelapse tab.
+      void useStore.getState().refreshOrphanCount();
     } catch (e) {
       console.error("refreshTimelapseJobs failed", e);
+    }
+  },
+  refreshTripGps: async (tripId) => {
+    try {
+      const archived = await ipcLoadTripGps(tripId);
+      // Set unconditionally (even when empty) so a rebuild that produced
+      // GPS replaces a stale/empty entry, and a trip with genuinely no
+      // GPS falls back correctly to the per-file pool.
+      set((s) => ({
+        tripGpsByTrip: { ...s.tripGpsByTrip, [tripId]: archived },
+      }));
+    } catch (e) {
+      console.error("refreshTripGps failed", e);
+    }
+  },
+  refreshOrphanCount: async () => {
+    try {
+      const n = await ipcCountOrphanTimelapseFiles();
+      set({ orphanTimelapseCount: n });
+    } catch (e) {
+      console.error("refreshOrphanCount failed", e);
     }
   },
   refreshLibrarySummary: async () => {
@@ -943,8 +995,15 @@ export const useStore = create<AppState>((set) => ({
   setReclaimableFilter: (reclaimableFilter) => set({ reclaimableFilter }),
   setTripModeFilter: (tripModeFilter) => set({ tripModeFilter }),
   startTimelapseRun: async (args) => {
+    // Optimistically flip both flags so the Progress card renders the
+    // "Scanning library…" indicator instantly. The backend's
+    // `timelapse:scanning` events still gate it authoritatively
+    // (false when scan finishes, before the encode loop emits start);
+    // this just removes the brief blank-progress flash between the
+    // click and the first event landing over IPC.
     set({
       timelapseRunning: true,
+      timelapseScanning: true,
       timelapseProgress: null,
       timelapseLastResult: null,
     });
@@ -952,7 +1011,7 @@ export const useStore = create<AppState>((set) => ({
       await ipcStartTimelapse(args);
     } catch (e) {
       console.error("startTimelapseRun failed", e);
-      set({ timelapseRunning: false });
+      set({ timelapseRunning: false, timelapseScanning: false });
       throw e;
     }
   },
