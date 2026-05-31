@@ -1,6 +1,6 @@
 # Trip Viewer — Design Document
 
-An open-source, multi-channel, GPS-aware dashcam viewer with hardware-accelerated playback and integrated SD card import. Originally built for Wolf Box 3-channel dashcams; now also supports Thinkware 2-channel, Miltona MNCD60 single-channel, and a generic 4-channel format, with a modular parser architecture for adding more. MIT licensed.
+An open-source, multi-channel, GPS-aware dashcam viewer with hardware-accelerated playback and integrated SD card import. Originally built for Wolf Box 3-channel dashcams; now also supports Thinkware 2-channel, Miltona MNCD60 single-channel, 70mai A810 / RC12 2-channel, and a generic 4-channel format, with a modular parser architecture for adding more (see `ADDING_A_CAMERA.md`). MIT licensed.
 
 **Repository:** [github.com/chrisl8/trip-viewer](https://github.com/chrisl8/trip-viewer)
 
@@ -43,7 +43,7 @@ There is **no open-source, multi-channel, GPS-aware dashcam viewer** that uses h
 - **Tauri v2** — Rust backend, web frontend, ~3 MB installer. Uses the system WebView2 runtime (pre-installed on Windows 10/11) on Windows and WebKitGTK 4.1 on Linux, instead of bundling Chromium.
 - **React 19 + TypeScript** — frontend with Zustand for state, Tailwind CSS v4 for styling.
 - **N HTML5 `<video>` elements** — one per channel, synchronized via `requestVideoFrameCallback` against a stable master ref (front when present, otherwise the first channel). The grid adapts to the dashcam's channel count (1 for Miltona, 2 for Thinkware, 3 for Wolf Box, up to 4 for the generic format). Hardware-accelerated decoding via the browser's native HEVC decoder.
-- **Leaflet + OpenStreetMap** — live GPS map with track polyline and interpolated vehicle marker. Auto-pans to follow the vehicle, but holds during user drag/zoom gestures.
+- **Leaflet + OpenStreetMap** — live GPS map with track polyline and interpolated vehicle marker. Auto-pans to follow the vehicle, but holds during user drag/zoom gestures. Opt-in **Lock-centre** and **Auto-zoom** toggles (any manual gesture disables them); void fixes are filtered and brief (≤2s) dropouts are bridged by dead-reckoning along the last heading/speed.
 - **Pure Rust container parsing** — `mp4` crate for metadata, custom binary parser for ShenShu GPS format. No ffprobe dependency.
 - **Optional ffmpeg for timelapse** — the timelapse feature shells out to a user-supplied ffmpeg binary (configured in-app, not bundled) to pre-render fast-playback MP4s with GPS-driven variable speed. NVENC/NVDEC is used when available. Distinct from the rejected "ffprobe for metadata" decision below — playback and import remain ffmpeg-free; timelapse is opt-in.
 
@@ -78,7 +78,7 @@ On Windows the app renders front, interior, and rear simultaneously by default. 
 | Maps | Leaflet + react-leaflet + OpenStreetMap tiles |
 | Video sync | `requestVideoFrameCallback` API |
 | Container parsing | `mp4` crate (pure Rust) |
-| GPS decoding | Custom ShenShu MetaData binary parser (Wolf Box) + NovaTek `gps0` atom parser (Miltona) |
+| GPS decoding | Custom ShenShu MetaData binary parser (Wolf Box) + NovaTek `gps0` atom parser (Miltona) + `GPSData*.txt` sidecar parser (70mai) |
 | Audio analysis | `symphonia` (pure Rust decoder, AAC / MP3 / ISO-MP4) for silence detection |
 | File hashing | `sha2` crate (SHA-256, optimized in dev builds) |
 | Tag + Place store | SQLite via `rusqlite` (bundled) + `rusqlite_migration` |
@@ -119,7 +119,7 @@ GpsPoint
 ├── heading: f64
 ```
 
-File detection uses Wolf Box naming: `YYYY_MM_DD_HHMMSS_EE_C.MP4` where `EE` is event code and `C` is channel (F/I/R). Files are grouped into triplets by fuzzy timestamp matching (3-second window), then merged into trips by time gaps (120-second threshold).
+File detection is multi-format (`scan/naming.rs`). Each parser maps a filename to a start time, `CameraKind`, channel label, and `EventMode` (Normal / Event / Parked / Lapse / Other). Examples: Wolf Box `YYYY_MM_DD_HHMMSS_EE_C.MP4`, 70mai `NO/EV/PA/LA{YYYYMMDD}-{HHMMSS}-{serial}{F|B}.MP4`. Files are grouped into segments by fuzzy timestamp matching (3-second window), then merged into trips by time gaps (120-second threshold). The recording mode is surfaced in the sidebar as a trip-list filter (derived client-side from the filename, no DB column).
 
 ---
 
@@ -131,7 +131,9 @@ File detection uses Wolf Box naming: `YYYY_MM_DD_HHMMSS_EE_C.MP4` where `EE` is 
 - **Click-to-swap layout** — click a side video to promote it to the main position; videos stay playing during swap (stable DOM, CSS-only repositioning)
 - **Fullscreen main video** — double-click the main panel to enter fullscreen (browser Fullscreen API), Escape to exit
 - **Transport controls** — play/pause, seek ±5s/±30s, speed (0.5x/1x/2x/4x/8x), source mode picker (originals vs. timelapse tier)
-- **Keyboard shortcuts** — Space, arrows, Shift+arrows, brackets for speed, D for drift HUD, M to enable multi-channel on Linux
+- **Keyboard shortcuts** — Space, arrows, Shift+arrows, brackets for speed, D for drift HUD, M to enable multi-channel on Linux. The shortcut overlay auto-opens on startup until the user opts out (persisted in `localStorage`).
+- **Collapsible sidebar** — the left panel folds to a thin strip so the video grid can take the full width
+- **Two-channel layout** — front+rear segments tuck the map under the rear view so the front fills 2/3 of the width; 3/4-channel layouts give the map its own column
 - **Segment auto-advance** — continuous playback across multi-segment trips
 - **HEVC support gate** — startup check with Store deep-link on Windows / apt-install hint on Linux if HEVC decoder is missing
 
@@ -140,14 +142,15 @@ File detection uses Wolf Box naming: `YYYY_MM_DD_HHMMSS_EE_C.MP4` where `EE` is 
 - **Live GPS map** — OpenStreetMap with Leaflet, track polyline drawn as video plays
 - **Interpolated vehicle marker** — smooth position updates between GPS samples
 - **Speed & heading HUD** — real-time readouts overlaid on the map panel; heading holds last moving direction when stopped, speed snaps to 0 at full stop
-- **Auto-pan with gesture release** — map follows the vehicle, but holds in place during user drag/zoom so you can inspect a moment without being yanked back
-- **Custom GPS parsers** — reverse-engineered ShenShu MetaData (Wolf Box) and NovaTek `gps0` atom (Miltona) binary formats
+- **Auto-pan with gesture release** — map follows the vehicle, but holds in place during user drag/zoom so you can inspect a moment without being yanked back. Opt-in **Lock centre** (vehicle pinned to map centre) and **Auto-zoom** (zoom from speed) toggles; any manual pan/zoom disables them.
+- **Dropout-tolerant track** — void GPS fixes are filtered so the marker never jumps to (0,0), and brief signal losses (≤2s) are bridged by dead-reckoning forward along the last heading at the last speed
+- **Custom GPS parsers** — reverse-engineered ShenShu MetaData (Wolf Box), NovaTek `gps0` atom (Miltona), and the 70mai `GPSData*.txt` plain-text sidecar (matched to clips by filename, with an `Other/` fallback for pre-feature imports)
 
 ### Library & file management
 
-- **Multi-format dashcam support** — Wolf Box 3-channel, Thinkware 2-channel, Miltona MNCD60 single-channel, generic 4-channel. Modular parser architecture in `scan/naming.rs` for adding more.
-- **Folder scanner** — recursive MP4 discovery, per-format filename parsing, fuzzy triplet matching, trip grouping. Skips `Timelapses/` and dot-directories on rescan.
-- **SD card import** — full pipeline: discover removable drives → stage with SHA-256 verification → wipe source → distribute to Videos/Photos. Duplicate detection, collision handling, unknown file prompts, cancel support, interrupt safety, lock file with PID recovery, logging with 30-day rotation
+- **Multi-format dashcam support** — Wolf Box 3-channel, Thinkware 2-channel, Miltona MNCD60 single-channel, 70mai A810/RC12 2-channel, generic 4-channel. Modular parser architecture in `scan/naming.rs` for adding more; the `ADDING_A_CAMERA.md` guide tells users how to capture their card's layout for a new-format request.
+- **Folder scanner** — recursive MP4 discovery, per-format filename parsing, fuzzy segment matching, trip grouping. Skips `Timelapses/` and dot-directories (including 70mai's `.s_Front` proxy folders) on both scan and import.
+- **SD card import** — full pipeline: discover removable drives → stage with SHA-256 verification → **confirm** → wipe source → distribute to Videos/Photos. After the verified copy a report asks whether to erase the card or keep the files (declining leaves it untouched). A **self-import guard** refuses sources that overlap the destination library; the `GPSData*.txt` sidecar is kept at the library root; a failed wipe delete prompts Retry/Skip/Cancel instead of aborting silently. Plus duplicate detection, collision handling, unknown-file prompts, cancel support, interrupt safety, lock file with PID recovery, logging with 30-day rotation.
 - **Import from a folder** — non-destructive variant of the same pipeline for files already on disk; no source wipe
 - **Import progress UI** — live progress bar with speed, file counter, phase indicators, cancel button; events throttled to ~15/sec to avoid IPC saturation
 - **Trip operations** — delete a whole trip (originals, timelapses, tags, optional source folder), or mark two or more trips and merge them manually. Merge dialog has a strategy picker for the surviving trip's timelapses (concatenate vs. drop and rebuild).
@@ -192,7 +195,7 @@ File detection uses Wolf Box naming: `YYYY_MM_DD_HHMMSS_EE_C.MP4` where `EE` is 
 
 ### Medium-term (polish and generalize)
 
-- **More dashcam parsers** — Viofo, BlackVue, GoPro on top of the existing Wolf Box / Thinkware / Miltona / Generic 4-channel set. Modular naming-parser architecture is already in place; each addition is small.
+- **More dashcam parsers** — Viofo, BlackVue, GoPro on top of the existing Wolf Box / Thinkware / Miltona / 70mai / Generic 4-channel set. Modular naming-parser architecture is already in place; each addition is small (see `ADDING_A_CAMERA.md`).
 - **Speed/altitude/g-force graphs** — if accelerometer data is available in the GPS stream
 - **Clip export** — select a time range, export to a new MP4
 - **Snapshot capture** — save a frame as an image
